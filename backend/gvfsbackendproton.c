@@ -153,40 +153,75 @@ do_mount (GVfsBackend  *backend,
       return;
     }
 
-  /* Retrieve the password from libsecret via secret-tool.
-   * This keeps libsecret out of the C backend's direct dependencies for now;
-   * replace with a direct libsecret call in a follow-up. */
-  gchar *password = NULL;
+  /* Fetch the three stored credentials from libsecret via secret-tool.
+   * The keyring holds uid, refresh_token, and salted_passphrase — not the
+   * raw password, which is never stored. */
+  gchar *uid               = NULL;
+  gchar *refresh_token     = NULL;
+  gchar *salted_pass_b64   = NULL;
+
   if (username)
     {
-      gchar *argv[] = {
-        "secret-tool", "lookup",
-        "schema", "org.gnome.proton.drive",
-        "username", (gchar *) username,
-        NULL
-      };
       gint exit_status;
-      g_spawn_sync (NULL, argv, NULL,
-                    G_SPAWN_SEARCH_PATH | G_SPAWN_STDERR_TO_DEV_NULL,
-                    NULL, NULL, &password, NULL, &exit_status, &error);
-      if (error)
-        {
-          g_vfs_job_failed_from_error (G_VFS_JOB (job), error);
-          g_error_free (error);
-          return;
-        }
-      /* strip trailing newline from secret-tool output */
-      g_strchomp (password);
+
+#define LOOKUP_FIELD(field, out) \
+      { \
+        gchar *argv[] = { "secret-tool", "lookup", \
+                          "schema",   "org.gnome.proton.drive", \
+                          "username", (gchar *) username, \
+                          "field",    field, NULL }; \
+        g_spawn_sync (NULL, argv, NULL, \
+                      G_SPAWN_SEARCH_PATH | G_SPAWN_STDERR_TO_DEV_NULL, \
+                      NULL, NULL, &(out), NULL, &exit_status, &error); \
+        if (error) goto cred_error; \
+        g_strchomp (out); \
+      }
+
+      LOOKUP_FIELD ("uid",               uid)
+      LOOKUP_FIELD ("refresh_token",     refresh_token)
+      LOOKUP_FIELD ("salted_passphrase", salted_pass_b64)
+#undef LOOKUP_FIELD
     }
 
-  if (!proton_rpc_auth (self->rpc, username ? username : "", password ? password : "", &error))
+  if (!uid || !refresh_token || !salted_pass_b64)
     {
-      g_free (password);
+      g_vfs_job_failed_literal (G_VFS_JOB (job), G_IO_ERROR,
+                                G_IO_ERROR_NOT_INITIALIZED,
+                                "no stored credentials — run the Proton Drive setup wizard first");
+      goto cred_cleanup;
+    }
+
+  {
+    gsize   sp_len  = 0;
+    guchar *sp_data = g_base64_decode (salted_pass_b64, &sp_len);
+    GBytes *sp      = g_bytes_new_take (sp_data, sp_len);
+
+    gboolean ok = proton_rpc_resume_session (self->rpc, uid, refresh_token, sp, &error);
+    g_bytes_unref (sp);
+
+    if (!ok)
+      {
+        g_vfs_job_failed_from_error (G_VFS_JOB (job), error);
+        g_error_free (error);
+        goto cred_cleanup;
+      }
+  }
+
+  g_free (uid);
+  g_free (refresh_token);
+  g_free (salted_pass_b64);
+
+  if (FALSE)
+    {
+cred_error:
       g_vfs_job_failed_from_error (G_VFS_JOB (job), error);
       g_error_free (error);
+cred_cleanup:
+      g_free (uid);
+      g_free (refresh_token);
+      g_free (salted_pass_b64);
       return;
     }
-  g_free (password);
 
   GMountSpec *spec = g_mount_spec_new ("proton");
   if (account)

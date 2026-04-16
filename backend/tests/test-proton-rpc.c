@@ -96,23 +96,42 @@ mock_server_stop (MockServer *srv)
 
 /* ---------- tests ---------- */
 
+/* "aGVsbG8=" = base64("hello") — used as a stand-in for salted_passphrase */
+#define FAKE_SP_B64 "aGVsbG8="
+
 static void
 test_auth_success (void)
 {
   const gchar *responses[] = {
-    "{\"id\":1,\"result\":{\"ok\":true}}"
+    "{\"id\":1,\"result\":{"
+    "\"uid\":\"uid-abc\","
+    "\"refresh_token\":\"tok-xyz\","
+    "\"salted_passphrase\":\"" FAKE_SP_B64 "\"}}"
   };
   MockServer *srv = mock_server_start (responses, G_N_ELEMENTS (responses));
 
-  GError    *error = NULL;
-  ProtonRpc *rpc   = proton_rpc_new (srv->socket_path, &error);
+  GError    *error          = NULL;
+  gchar     *uid            = NULL;
+  gchar     *refresh_token  = NULL;
+  GBytes    *salted_pass    = NULL;
+  ProtonRpc *rpc            = proton_rpc_new (srv->socket_path, &error);
   g_assert_no_error (error);
   g_assert_nonnull (rpc);
 
-  gboolean ok = proton_rpc_auth (rpc, "user@proton.me", "secret", &error);
+  gboolean ok = proton_rpc_auth (rpc, "user@proton.me", "secret",
+                                  &uid, &refresh_token, &salted_pass, &error);
   g_assert_no_error (error);
   g_assert_true (ok);
+  g_assert_cmpstr (uid, ==, "uid-abc");
+  g_assert_cmpstr (refresh_token, ==, "tok-xyz");
+  g_assert_nonnull (salted_pass);
+  gsize sp_len;
+  const guchar *sp = g_bytes_get_data (salted_pass, &sp_len);
+  g_assert_cmpmem (sp, sp_len, "hello", 5);
 
+  g_free (uid);
+  g_free (refresh_token);
+  g_bytes_unref (salted_pass);
   proton_rpc_free (rpc);
   mock_server_stop (srv);
 }
@@ -129,12 +148,35 @@ test_auth_failure (void)
   ProtonRpc *rpc   = proton_rpc_new (srv->socket_path, &error);
   g_assert_nonnull (rpc);
 
-  gboolean ok = proton_rpc_auth (rpc, "user@proton.me", "wrong", &error);
+  gboolean ok = proton_rpc_auth (rpc, "user@proton.me", "wrong",
+                                  NULL, NULL, NULL, &error);
   g_assert_false (ok);
   g_assert_nonnull (error);
   g_assert_cmpstr (error->message, ==, "authentication failed");
   g_error_free (error);
 
+  proton_rpc_free (rpc);
+  mock_server_stop (srv);
+}
+
+static void
+test_resume_session (void)
+{
+  const gchar *responses[] = {
+    "{\"id\":1,\"result\":{\"ok\":true}}"
+  };
+  MockServer *srv = mock_server_start (responses, G_N_ELEMENTS (responses));
+
+  GError  *error    = NULL;
+  GBytes  *sp       = g_bytes_new_static ("hello", 5);
+  ProtonRpc *rpc    = proton_rpc_new (srv->socket_path, &error);
+  g_assert_nonnull (rpc);
+
+  gboolean ok = proton_rpc_resume_session (rpc, "uid-abc", "tok-xyz", sp, &error);
+  g_assert_no_error (error);
+  g_assert_true (ok);
+
+  g_bytes_unref (sp);
   proton_rpc_free (rpc);
   mock_server_stop (srv);
 }
@@ -255,12 +297,13 @@ main (int argc, char **argv)
 {
   g_test_init (&argc, &argv, NULL);
 
-  g_test_add_func ("/proton-rpc/auth-success", test_auth_success);
-  g_test_add_func ("/proton-rpc/auth-failure", test_auth_failure);
-  g_test_add_func ("/proton-rpc/list-dir",     test_list_dir);
-  g_test_add_func ("/proton-rpc/stat",         test_stat);
-  g_test_add_func ("/proton-rpc/read-file",    test_read_file);
-  g_test_add_func ("/proton-rpc/not-found",    test_not_found);
+  g_test_add_func ("/proton-rpc/auth-success",    test_auth_success);
+  g_test_add_func ("/proton-rpc/auth-failure",    test_auth_failure);
+  g_test_add_func ("/proton-rpc/resume-session",  test_resume_session);
+  g_test_add_func ("/proton-rpc/list-dir",        test_list_dir);
+  g_test_add_func ("/proton-rpc/stat",            test_stat);
+  g_test_add_func ("/proton-rpc/read-file",       test_read_file);
+  g_test_add_func ("/proton-rpc/not-found",       test_not_found);
 
   return g_test_run ();
 }

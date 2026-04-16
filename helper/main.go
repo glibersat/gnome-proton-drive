@@ -41,12 +41,37 @@ func main() {
 		return session, nil
 	}
 
+	// Auth performs a full SRP login. Returns credentials that the caller
+	// should store in libsecret; the password must not be stored.
 	srv.Register("Auth", func(ctx context.Context, raw json.RawMessage) (any, error) {
 		var p rpc.AuthParams
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, &rpc.RPCError{Code: rpc.ErrInvalidArg, Message: err.Error()}
 		}
-		s, err := drive.NewSession(ctx, mgr, p.Username, p.Password)
+		s, creds, err := drive.NewSession(ctx, mgr, p.Username, p.Password)
+		if err != nil {
+			return nil, &rpc.RPCError{Code: rpc.ErrAuthFailed, Message: err.Error()}
+		}
+		session = s
+		return rpc.AuthResult{
+			UID:              creds.UID,
+			RefreshToken:     creds.RefreshToken,
+			SaltedPassphrase: creds.SaltedPassphrase,
+		}, nil
+	})
+
+	// ResumeSession restores a session from stored credentials — no password.
+	// This is what gvfsd-proton calls on every mount.
+	srv.Register("ResumeSession", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		var p rpc.ResumeParams
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, &rpc.RPCError{Code: rpc.ErrInvalidArg, Message: err.Error()}
+		}
+		s, err := drive.ResumeSession(ctx, mgr, drive.SessionCredentials{
+			UID:              p.UID,
+			RefreshToken:     p.RefreshToken,
+			SaltedPassphrase: p.SaltedPassphrase,
+		})
 		if err != nil {
 			return nil, &rpc.RPCError{Code: rpc.ErrAuthFailed, Message: err.Error()}
 		}

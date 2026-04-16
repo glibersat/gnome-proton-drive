@@ -22,10 +22,23 @@ ProtonRpc  *proton_rpc_new          (const gchar  *socket_path,
                                      GError      **error);
 void        proton_rpc_free         (ProtonRpc    *rpc);
 
+/* Full SRP login — only called from the setup wizard, not from do_mount.
+ * On success the returned AuthResult fields should be stored in libsecret. */
 gboolean    proton_rpc_auth         (ProtonRpc    *rpc,
                                      const gchar  *username,
                                      const gchar  *password,
+                                     gchar       **out_uid,
+                                     gchar       **out_refresh_token,
+                                     GBytes      **out_salted_passphrase,
                                      GError      **error);
+
+/* Resume a session from stored credentials — no password needed.
+ * Called by do_mount on every mount. */
+gboolean    proton_rpc_resume_session (ProtonRpc    *rpc,
+                                       const gchar  *uid,
+                                       const gchar  *refresh_token,
+                                       GBytes       *salted_passphrase,
+                                       GError      **error);
 
 /* Returns a NULL-terminated array of ProtonEntry* owned by the caller.
  * Free each entry with proton_entry_free(), then g_free() the array. */

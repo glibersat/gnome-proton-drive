@@ -135,10 +135,13 @@ proton_rpc_free (ProtonRpc *rpc)
 }
 
 gboolean
-proton_rpc_auth (ProtonRpc   *rpc,
-                 const gchar *username,
-                 const gchar *password,
-                 GError     **error)
+proton_rpc_auth (ProtonRpc    *rpc,
+                 const gchar  *username,
+                 const gchar  *password,
+                 gchar       **out_uid,
+                 gchar       **out_refresh_token,
+                 GBytes      **out_salted_passphrase,
+                 GError      **error)
 {
   g_autoptr(JsonBuilder) b = json_builder_new ();
   json_builder_begin_object (b);
@@ -149,6 +152,49 @@ proton_rpc_auth (ProtonRpc   *rpc,
   json_builder_end_object (b);
 
   g_autoptr(JsonObject) resp = call (rpc, "Auth", b, error);
+  if (!resp)
+    return FALSE;
+
+  JsonObject *result = json_object_get_object_member (resp, "result");
+
+  if (out_uid)
+    *out_uid = g_strdup (json_object_get_string_member (result, "uid"));
+  if (out_refresh_token)
+    *out_refresh_token = g_strdup (json_object_get_string_member (result, "refresh_token"));
+  if (out_salted_passphrase)
+    {
+      const gchar *b64   = json_object_get_string_member (result, "salted_passphrase");
+      gsize        dlen  = 0;
+      guchar      *data  = g_base64_decode (b64, &dlen);
+      *out_salted_passphrase = g_bytes_new_take (data, dlen);
+    }
+
+  return TRUE;
+}
+
+gboolean
+proton_rpc_resume_session (ProtonRpc    *rpc,
+                            const gchar  *uid,
+                            const gchar  *refresh_token,
+                            GBytes       *salted_passphrase,
+                            GError      **error)
+{
+  gsize        sp_len;
+  const guchar *sp_data = g_bytes_get_data (salted_passphrase, &sp_len);
+  gchar        *sp_b64  = g_base64_encode (sp_data, sp_len);
+
+  g_autoptr(JsonBuilder) b = json_builder_new ();
+  json_builder_begin_object (b);
+  json_builder_set_member_name (b, "uid");
+  json_builder_add_string_value (b, uid);
+  json_builder_set_member_name (b, "refresh_token");
+  json_builder_add_string_value (b, refresh_token);
+  json_builder_set_member_name (b, "salted_passphrase");
+  json_builder_add_string_value (b, sp_b64);
+  json_builder_end_object (b);
+  g_free (sp_b64);
+
+  g_autoptr(JsonObject) resp = call (rpc, "ResumeSession", b, error);
   return resp != NULL;
 }
 

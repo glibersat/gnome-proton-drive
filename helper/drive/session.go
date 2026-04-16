@@ -23,13 +23,57 @@ type Session struct {
 	nodeKRs map[string]*crypto.KeyRing // linkID → decrypted node keyring (cache)
 }
 
-func NewSession(ctx context.Context, mgr *proton.Manager, username, password string) (*Session, error) {
-	c, _, err := mgr.NewClientWithLogin(ctx, username, []byte(password))
+// SessionCredentials holds the values that should be stored in libsecret
+// so that future mounts can resume without re-doing SRP.
+type SessionCredentials struct {
+	UID              string
+	RefreshToken     string
+	SaltedPassphrase []byte // KDF output — unlocks address keys but not SRP login
+}
+
+// NewSession authenticates via SRP and returns the session plus the
+// credentials that should be persisted in the keyring.
+func NewSession(ctx context.Context, mgr *proton.Manager, username, password string) (*Session, SessionCredentials, error) {
+	c, auth, err := mgr.NewClientWithLogin(ctx, username, []byte(password))
 	if err != nil {
-		return nil, err
+		return nil, SessionCredentials{}, err
 	}
 
-	addrKR, err := unlockPrimaryAddress(ctx, c, []byte(password))
+	addrKR, saltedPass, err := unlockPrimaryAddress(ctx, c, []byte(password))
+	if err != nil {
+		_ = c.AuthDelete(ctx)
+		return nil, SessionCredentials{}, err
+	}
+
+	shareID, rootID, err := findMainShare(ctx, c)
+	if err != nil {
+		_ = c.AuthDelete(ctx)
+		return nil, SessionCredentials{}, err
+	}
+
+	creds := SessionCredentials{
+		UID:              auth.UID,
+		RefreshToken:     auth.RefreshToken,
+		SaltedPassphrase: saltedPass,
+	}
+	return &Session{
+		client:  c,
+		shareID: shareID,
+		rootID:  rootID,
+		addrKR:  addrKR,
+		nodeKRs: make(map[string]*crypto.KeyRing),
+	}, creds, nil
+}
+
+// ResumeSession restores a fully authenticated session from the three values
+// stored in the keyring — no SRP re-auth needed.
+func ResumeSession(ctx context.Context, mgr *proton.Manager, creds SessionCredentials) (*Session, error) {
+	c, _, err := mgr.NewClientWithRefresh(ctx, creds.UID, creds.RefreshToken)
+	if err != nil {
+		return nil, fmt.Errorf("token refresh failed: %w", err)
+	}
+
+	addrKR, err := unlockWithSaltedPassphrase(ctx, c, creds.SaltedPassphrase)
 	if err != nil {
 		_ = c.AuthDelete(ctx)
 		return nil, err
@@ -236,18 +280,36 @@ func splitPath(p string) []string {
 	return strings.Split(strings.TrimPrefix(p, "/"), "/")
 }
 
-func unlockPrimaryAddress(ctx context.Context, c *proton.Client, password []byte) (*crypto.KeyRing, error) {
+// unlockPrimaryAddress derives the salted passphrase from the raw password,
+// unlocks the address keyring, and returns both so the passphrase can be
+// stored in the keyring for future passwordless resumes.
+func unlockPrimaryAddress(ctx context.Context, c *proton.Client, password []byte) (*crypto.KeyRing, []byte, error) {
 	user, err := c.GetUser(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	salts, err := c.GetSalts(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	saltedPass, err := salts.SaltForKey(password, user.Keys[0].ID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	kr, err := unlockWithSaltedPassphrase(ctx, c, saltedPass)
+	if err != nil {
+		return nil, nil, err
+	}
+	return kr, saltedPass, nil
+}
+
+// unlockWithSaltedPassphrase restores the address keyring from the stored
+// salted passphrase — no raw password needed.
+func unlockWithSaltedPassphrase(ctx context.Context, c *proton.Client, saltedPass []byte) (*crypto.KeyRing, error) {
+	user, err := c.GetUser(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -262,7 +324,6 @@ func unlockPrimaryAddress(ctx context.Context, c *proton.Client, password []byte
 		return nil, err
 	}
 
-	// Return the keyring for the primary (first) address.
 	for _, addr := range addrs {
 		if kr, ok := addrKRs[addr.ID]; ok {
 			return kr, nil

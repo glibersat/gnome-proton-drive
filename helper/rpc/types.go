@@ -36,6 +36,25 @@ type AuthParams struct {
 	Password string `json:"password"`
 }
 
+// AuthResult is returned by Auth. The caller should persist all three fields
+// in the keyring and discard the password. SaltedPassphrase is the output of
+// Proton's KDF (bcrypt over password + server salt); it unlocks the address
+// keyring but cannot be used for SRP login, making it safer to store than
+// the raw password.
+type AuthResult struct {
+	UID              string `json:"uid"`
+	RefreshToken     string `json:"refresh_token"`
+	SaltedPassphrase []byte `json:"salted_passphrase"`
+}
+
+// ResumeParams allows restoring a session from stored credentials without
+// re-doing SRP.
+type ResumeParams struct {
+	UID              string `json:"uid"`
+	RefreshToken     string `json:"refresh_token"`
+	SaltedPassphrase []byte `json:"salted_passphrase"`
+}
+
 type ListDirParams struct{ Path string `json:"path"` }
 type ListDirResult struct {
 	Entries []Entry `json:"entries"`

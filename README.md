@@ -61,14 +61,29 @@ pkill gvfsd; gvfsd &    # or log out and back in
 
 ## First mount (read-only)
 
-**1. Store your credentials in the GNOME keyring:**
+**1. Authenticate and store session tokens in the GNOME keyring:**
+
+The setup wizard (planned, not yet built) will handle this automatically.
+For now, use the helper binary directly to perform the initial SRP login
+and capture the returned tokens:
 
 ```sh
-secret-tool store --label="Proton Drive" \
-  schema org.gnome.proton.drive \
-  username you@proton.me
-# enter your Proton password at the prompt
+# Authenticate once to capture uid, refresh_token, and salted_passphrase
+./proton-drive-helper --socket /tmp/setup.sock &
+echo '{"id":1,"method":"Auth","params":{"username":"you@proton.me","password":"YOUR_PASSWORD"}}' \
+  | nc -U /tmp/setup.sock | jq .
+
+# Store the three token fields from the response — not the password
+secret-tool store --label="Proton Drive uid" \
+  schema org.gnome.proton.drive username you@proton.me field uid
+secret-tool store --label="Proton Drive refresh_token" \
+  schema org.gnome.proton.drive username you@proton.me field refresh_token
+secret-tool store --label="Proton Drive salted_passphrase" \
+  schema org.gnome.proton.drive username you@proton.me field salted_passphrase
 ```
+
+The password is only used during the initial `Auth` call and is never stored.
+Subsequent mounts use `ResumeSession` with the stored tokens.
 
 **2. Mount the drive:**
 
