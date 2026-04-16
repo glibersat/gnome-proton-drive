@@ -225,34 +225,17 @@ class SetupWindow(Gtk.ApplicationWindow):
             return
 
         ucm = WebKit.UserContentManager()
-        ucm.register_script_message_handler('proton')
-        ucm.connect('script-message-received::proton', self._on_captcha_token)
-
-        inject = """
-window.addEventListener('message', function(e) {
-  if (e.data && e.data.type === 'pm_captcha') {
-    window.webkit.messageHandlers.proton.postMessage(e.data.token);
-  }
-});
-"""
-        inject_time = (getattr(WebKit.UserScriptInjectionTime, 'DOCUMENT_START', None)
-                       or WebKit.UserScriptInjectionTime.START)
-        try:
-            script = WebKit.UserScript(
-                inject,
-                WebKit.UserContentInjectedFrames.ALL_FRAMES,
-                inject_time,
-            )
-        except TypeError:
-            script = WebKit.UserScript(
-                inject,
-                WebKit.UserContentInjectedFrames.ALL_FRAMES,
-                inject_time,
-                None, None,
-            )
-        ucm.add_script(script)
+        # Proton's captcha page detects window.webkit.messageHandlers.linuxWebkitWebview
+        # and sends the pm_captcha result through it natively on Linux.
+        ucm.register_script_message_handler('linuxWebkitWebview')
+        ucm.connect('script-message-received::linuxWebkitWebview', self._on_captcha_token)
 
         wv = WebKit.WebView(user_content_manager=ucm)
+
+        # Enable inspector so we can see JS errors and network failures
+        settings = wv.get_settings()
+        settings.set_enable_developer_extras(True)
+        wv.get_inspector().show()
         wv.set_vexpand(True)
         wv.set_hexpand(True)
 
@@ -296,9 +279,15 @@ window.addEventListener('message', function(e) {
 
     def _on_captcha_token(self, _mgr, js_result):
         try:
-            token = js_result.get_js_value().to_string()   # WebKit 6
+            val = js_result.get_js_value()          # WebKit 6
         except AttributeError:
-            token = js_result.get_value().to_string()       # WebKit2 4.x
+            val = js_result.get_value()             # WebKit2 4.x
+        try:
+            # Page sends {type: 'pm_captcha', token: '...'} as an object
+            token = val.object_get_property('token').to_string()
+        except Exception:
+            token = val.to_string()
+        print(f'[setup] captcha token received: {token[:8]}…', file=sys.stderr)
         threading.Thread(target=self._auth_hv_thread, args=(token,), daemon=True).start()
 
     # ----- RPC threads -----
