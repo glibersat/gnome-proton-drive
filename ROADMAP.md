@@ -10,10 +10,15 @@ before the final assembly.
 Track A: Credentials       Track B: Go helper        Track C: GVfs backend
 ─────────────────────      ──────────────────────     ──────────────────────
 A1. libsecret storage   →
-A2. credential UI       →  B3. write operations   →  C1. backend skeleton
-A3. GOA provider        →                         →  C2. volume monitor
+A2. setup wizard        →  B3. write operations   →  C1. backend skeleton
+                        →                         →  C2. volume monitor
+A3. GOA provider        →                         →     (future upgrade)
                                                    →  C3. two-way sync
 ```
+
+**M1 strategy:** A1 + A2 feed directly into C2 via libsecret. No GOA dependency
+for the first working mount. A3 is a later UX upgrade that slots in without
+changing the backend architecture.
 
 ---
 
@@ -24,82 +29,66 @@ A3. GOA provider        →                         →  C2. volume monitor
 Store and retrieve Proton credentials independently of GOA so the helper and
 backend have a working auth path from day one.
 
-- Use `libsecret` to store `{username, password}` (or a session token once
-  Proton exposes one) in the user's keyring under a well-known schema:
-  `org.gnome.proton.drive / username=<email>`
-- The Go helper reads the socket path and account ID from argv; it fetches
-  the credential from the keyring at startup via a small C shim or via a
-  `secret-tool`-style subprocess call.
+- Use `libsecret` to store `{username, session_token}` in the user's keyring
+  under a well-known schema: `org.gnome.proton.drive / username=<email>`.
+- Store the session token (returned by `go-proton-api` after SRP login), not
+  the raw password — the password never leaves the setup wizard process.
+- The Go helper receives the account ID via argv and fetches its token from the
+  keyring at startup using `secret-tool` or a small C shim.
 - **Why not store credentials in the helper itself:** the keyring survives
   helper restarts and is unlocked by PAM at login, matching GNOME conventions.
 
-### A2. Standalone credential UI (short-term, no upstream dependency)
+### A2. Setup wizard (self-contained, no upstream dependency)
 
-A minimal GTK4 dialog (`gnome-proton-auth`) that:
+A minimal GTK4 dialog (`gnome-proton-setup`) that:
 
-1. Prompts for email + password (or opens a Proton web-auth flow in a
-   `WebKitWebView` if Proton ever exposes OAuth2).
-2. Writes the credential to libsecret via the schema above.
-3. Signals the GVfs volume monitor (via D-Bus or a well-known flag file) that
-   a new account is available, triggering an auto-mount.
+1. Prompts for email + password.
+2. Delegates the SRP challenge/response to `proton-drive-helper` over the RPC
+   socket — the GTK layer never holds the plaintext password beyond one RPC
+   round-trip.
+3. On success, writes the returned session token to libsecret (A1).
+4. Emits a signal on our own D-Bus service (`org.gnome.ProtonDrive`) to notify
+   the volume monitor that a new account is available.
 
-This gives a working end-to-end flow without any upstream changes and can ship
-as part of this package.
+**Why our own D-Bus service, not GOA's:**
+`goa-daemon` owns `org.gnome.OnlineAccounts` and its `Manager.AddAccount()`
+rejects any `provider_type` not compiled into the daemon. We cannot register
+objects on a bus name we don't own, and writing `Provider=proton` directly into
+`~/.config/goa-1.0/accounts.conf` is equally rejected at daemon reload. Our
+volume monitor (C2) watches our own D-Bus service and libsecret directly,
+making GOA a non-dependency for M1–M3.
 
-**Open question:** Proton's authentication uses SRP (Secure Remote Password),
-not a standard OAuth2 flow. The login challenge/response must go through the
-Go helper (which already uses `go-proton-api` for SRP). The GTK dialog should
-therefore delegate authentication to the helper over the RPC socket rather than
-handling the password directly, so the GTK layer never holds the plaintext
-password longer than one RPC round-trip.
+This gives a fully working end-to-end flow shipping entirely within this
+package.
 
 ### A3. GOA provider (long-term, proper GNOME integration)
 
 Adding Proton as a first-class entry in GNOME Settings → Online Accounts.
+**Not required for M1–M3.** When it lands, C2 gains a second credential source
+(GOA) alongside libsecret, with no other backend changes.
 
 **Hard constraint:** GOA providers are compiled into `gnome-online-accounts`.
-There is no external plugin mechanism (`libpeas` is not used). The options are:
+There is no external plugin mechanism. The options are:
 
-#### Option A3-a — Contribute upstream (recommended long-term)
+#### Option A3-a — Contribute upstream (recommended)
 
-Submit a `GoaProtonProvider` to the GOA project. The provider would:
+Submit a `GoaProtonProvider` to the GOA project:
 
-- Subclass `GoaProvider` (not `GoaOAuth2Provider` — Proton uses SRP, not
-  OAuth2, so the base class is more appropriate).
-- Implement `build_object()` to attach `GoaFiles` (and optionally `GoaMail`,
-  `GoaCalendar`) service interfaces to the account object.
-- Implement `add_account()` and `refresh_account()` UI dialogs using GTK4,
-  delegating the SRP challenge to a helper subprocess to avoid pulling Go
-  into the GOA daemon.
-- Store the session token in libsecret via GOA's standard keyring helpers.
+- Subclass `GoaProvider` (not `GoaOAuth2Provider` — Proton uses SRP).
+- Implement `build_object()` to attach `GoaFiles` (and optionally `GoaMail`)
+  service interfaces.
+- Implement `add_account()` / `refresh_account()` dialogs delegating SRP to a
+  helper subprocess — no Go in the GOA daemon.
+- Store the session token via GOA's standard libsecret helpers.
 
-Prerequisites for upstream acceptance:
-- Proton must provide a stable, documented API (the current `go-proton-api` is
-  "maintained but not actively seeking contributors" and has no write-path
-  stability guarantees yet).
-- The provider must not introduce new non-GNOME build dependencies into the
-  GOA tree — the SRP/crypto work must stay out-of-process.
+Prerequisites: stable Proton API, no new non-GNOME build deps in the GOA tree.
+Multi-month process requiring upstream maintainer review.
 
-This is a multi-month process requiring upstream GNOME maintainer review.
+#### Option A3-b — Patched GOA package (distribution bridge)
 
-#### Option A3-b — Patched GOA package (distribution path)
-
-Ship a downstream `gnome-online-accounts` package with the Proton provider
-patched in. Works for Flatpak-distributed settings panels or distro packages,
-but creates a maintenance burden on every GOA release.
-
-Only recommended as a bridge until Option A3-a lands.
-
-#### Option A3-c — GOA D-Bus impersonation (not recommended)
-
-Register a D-Bus service that mimics the GOA account D-Bus interface for a
-Proton account, making it appear to GVfs as a GOA-managed account without
-touching the GOA source. Technically possible but fragile: any GOA API change
-breaks it silently, and it violates the intended contract.
-
-**Decision:** Implement A2 first for a self-contained working product. Pursue
-A3-a in parallel as a separate upstream contribution once the integration is
-stable.
+Ship a downstream `gnome-online-accounts` with the Proton provider patched in.
+Viable for distro packages while A3-a is in review; maintenance burden on every
+GOA release.
 
 ---
 
@@ -123,18 +112,17 @@ Three sub-tasks, each blocked on `go-proton-api` upstream:
 | Sub-task | Blocker |
 |---|---|
 | `Mkdir` | Need crypto helpers to generate `NodeKey` + `NodePassphrase` for a new folder node. `go-proton-api` exposes `CreateFolder` but not the key-generation step. |
-| `WriteFile` | Need block encryption + `RequestBlockUpload` + `UpdateRevision` flow. The API calls exist; the crypto wrapper (generate session key, encrypt blocks, sign manifest) does not yet exist in the library. |
-| `Move` / `Rename` | `go-proton-api` has no `MoveLink` call at all. Needs either an upstream addition or a raw HTTP implementation against the `/drive/shares/{id}/files/{id}/move` endpoint. |
+| `WriteFile` | Need block encryption + `RequestBlockUpload` + `UpdateRevision`. API calls exist; crypto wrapper (generate session key, encrypt blocks, sign manifest) does not. |
+| `Move` / `Rename` | `go-proton-api` has no `MoveLink` call. Needs upstream addition or raw HTTP against `/drive/shares/{id}/files/{id}/move`. |
 
-Track these against `go-proton-api` releases. When unblocked, implement
-in `drive/session.go` and register the `WriteFile` handler in `main.go`.
+Track against `go-proton-api` releases. When unblocked, implement in
+`drive/session.go` and register the `WriteFile` handler in `main.go`.
 
 ### B4. Event polling for two-way sync
 
-Proton Drive exposes a `/drive/shares/{id}/events/{eventID}` endpoint. Poll
-it on a configurable interval (default 30 s) and emit invalidation signals
-over a second Unix socket or over the same RPC connection as server-push
-events:
+Proton Drive exposes a `/drive/shares/{id}/events/{eventID}` endpoint. Poll on
+a configurable interval (default 30 s) and push invalidation events over the
+RPC connection:
 
 ```json
 {"event": "changed", "path": "/Documents/file.txt"}
@@ -151,39 +139,37 @@ triggering Nautilus refreshes without polling from the C side.
 
 ### C1. Backend skeleton
 
-Implement `gvfsd-proton` in C, following the pattern of `gvfsd-sftp` or
-`gvfsd-google`:
+Implement `gvfsd-proton` in C, following the pattern of `gvfsd-sftp`:
 
 - Subclass `GVfsBackend`.
-- On `mount`, spawn `proton-drive-helper` with a per-mount socket path,
-  send `Auth` with credentials fetched from libsecret (A1), and verify the
-  connection.
-- Implement the mandatory VFS ops by translating them to RPC calls:
-  `open_for_read`, `read`, `close_read`, `query_info`, `enumerate`.
-- Stub write ops (`open_for_write`, `write`, `close_write`, `make_directory`,
-  `set_display_name`, `delete`) with `G_IO_ERROR_NOT_SUPPORTED` until B3 lands.
+- On `mount`, read credentials from libsecret (A1), spawn
+  `proton-drive-helper --socket <path> --account <email>`, send `Auth`, and
+  verify the connection.
+- Implement read-only VFS ops via RPC: `open_for_read`, `read`, `close_read`,
+  `query_info`, `enumerate`.
+- Stub write ops with `G_IO_ERROR_NOT_SUPPORTED` until B3 lands.
 
 ### C2. Volume monitor
 
-A small `gvfsd-proton-volume-monitor` daemon (or integrated into the backend):
+A `gvfsd-proton-volume-monitor` daemon that makes the drive appear in Nautilus:
 
-- Watches libsecret for Proton credentials (A1) or GOA account additions (A3).
-- Calls `g_volume_monitor_adopt_orphan_mount()` / emits `volume-added` on
-  `GVfsVolumeMonitor` to make the drive appear in Nautilus.
-- Provides icon (`proton-drive` symbolic), display name, and UUID derived from
-  the Proton account email.
+- **Primary source (M1–M3):** watch libsecret for entries matching the
+  `org.gnome.proton.drive` schema, and listen on `org.gnome.ProtonDrive` D-Bus
+  for account-added/removed signals emitted by the setup wizard (A2).
+- **Secondary source (M4+):** additionally watch `GoaClient` for GOA accounts
+  with `provider_type=proton` once A3 lands.
+- On account detected: emit `volume-added` on `GVfsVolumeMonitor`, providing
+  icon (`proton-drive` symbolic), display name, and UUID from the account email.
+- On account removed: unmount and emit `volume-removed`.
 
 ### C3. Two-way sync
 
-- **Remote → local:** consume events from B4; call
-  `g_file_monitor_emit_event()` on affected paths so Nautilus and open file
-  handles see changes without re-stating.
-- **Local → remote:** all VFS write ops (C1 write stubs, once B3 is done) go
-  directly to the API via the helper — there is no separate sync step for
-  writes. The GVfs backend is the sync layer.
+- **Remote → local:** consume events from B4; call `g_file_monitor_emit_event()`
+  so Nautilus and open file handles see changes without re-stating.
+- **Local → remote:** VFS write ops (once B3 is done) go directly to the API
+  via the helper — no separate sync step.
 - **Conflict policy:** last-write-wins for now (matches Proton Drive web
-  client behaviour). Document as a known limitation; revisit if revision
-  history API becomes accessible.
+  behaviour). Revisit once revision history API is accessible.
 
 ---
 
@@ -194,25 +180,22 @@ A small `gvfsd-proton-volume-monitor` daemon (or integrated into the backend):
 | **M1 — Read-only mount** | A1 + A2 + B1 + C1 + C2 | Proton Drive visible in Nautilus; files openable read-only |
 | **M2 — Live updates** | B4 + C3 (remote→local) | Nautilus refreshes when remote changes |
 | **M3 — Full read/write** | B3 + C1 (writes) + C3 | Create, edit, move, delete from Nautilus |
-| **M4 — Settings panel** | A3-a | Proton Drive in GNOME Settings → Online Accounts |
+| **M4 — Settings panel** | A3-a or A3-b | Proton Drive in GNOME Settings → Online Accounts |
 
 ---
 
 ## Open questions
 
-1. **SRP vs OAuth2 in GOA:** GOA's credential refresh machinery is designed
-   around OAuth2 token refresh. Proton's SRP-based auth does not map cleanly
-   onto this. The session token returned by `go-proton-api` after login has an
-   unknown TTL. Need to determine: does the token expire, and if so, what is
-   the re-auth UX?
+1. **Session token TTL:** The session token returned by `go-proton-api` after
+   SRP login has an unknown expiry. Need to determine re-auth UX: silent
+   background re-auth via stored password, or a re-prompt dialog?
 
 2. **Flatpak sandboxing:** `gvfsd` backends must run outside the Flatpak
    sandbox. Packaging strategy (system package vs. Flatpak portal) is TBD.
 
-3. **Multi-account:** The volume monitor and helper should support multiple
-   Proton accounts simultaneously (one helper process per account). Design the
-   socket path as `/run/user/{uid}/proton-drive-{account-hash}.sock`.
+3. **Multi-account:** One helper process per account. Socket path:
+   `/run/user/{uid}/proton-drive-{sha256(email)[:8]}.sock`.
 
-4. **go-proton-api stability:** The library is at a pre-1.0 pseudo-version
-   pinned to a specific commit. Establish a policy for tracking upstream
-   (pin + periodic manual upgrade, or contribute a `go.mod` tag request).
+4. **go-proton-api stability:** Pinned to a pre-1.0 pseudo-version at a
+   specific commit. Policy needed: periodic manual upgrade or request a
+   semver tag from upstream.
