@@ -92,6 +92,22 @@ GOA release.
 
 ---
 
+## Testing
+
+Tests must be written alongside every piece of code — never deferred.
+
+- **Go helper (`helper/`):** `_test.go` files in the same package. Cover RPC
+  serialisation, path resolution logic, and session helpers with unit tests.
+  Use the `go-proton-api` dev server (in `server/`) for integration tests that
+  need a live Proton API.
+- **C backend (`backend/`):** `tests/` directory built with meson. Unit-test
+  the RPC client (`proton-rpc.c`) by spinning a mock Unix socket server in the
+  test process. Integration tests mount against a running `proton-drive-helper`
+  pointed at the dev server.
+- CI must run both suites on every commit.
+
+---
+
 ## Track B — Go helper completion
 
 ### B1. Path resolution cache ✅ (partial — in-memory only)
