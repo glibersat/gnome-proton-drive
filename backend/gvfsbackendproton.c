@@ -39,6 +39,12 @@ fill_file_info (GFileInfo *info, ProtonEntry *e)
     {
       g_file_info_set_file_type (info, G_FILE_TYPE_DIRECTORY);
       g_file_info_set_content_type (info, "inode/directory");
+      GIcon *icon = g_themed_icon_new ("folder");
+      GIcon *sicon = g_themed_icon_new ("folder-symbolic");
+      g_file_info_set_icon (info, icon);
+      g_file_info_set_symbolic_icon (info, sicon);
+      g_object_unref (icon);
+      g_object_unref (sicon);
     }
   else
     {
@@ -48,6 +54,10 @@ fill_file_info (GFileInfo *info, ProtonEntry *e)
       if (content_type)
         {
           g_file_info_set_content_type (info, content_type);
+          GIcon *icon  = g_content_type_get_icon (content_type);
+          GIcon *sicon = g_content_type_get_symbolic_icon (content_type);
+          if (icon)  { g_file_info_set_icon (info, icon);           g_object_unref (icon); }
+          if (sicon) { g_file_info_set_symbolic_icon (info, sicon); g_object_unref (sicon); }
           g_free (content_type);
         }
     }
