@@ -144,9 +144,15 @@ do_mount (GVfsBackend  *backend,
   gchar *socket_path = g_strdup_printf ("/run/user/%u/proton-drive-%s.sock",
                                         getuid (), account);
 
-  /* Spawn the helper if its socket isn't already listening. */
-  if (!g_file_test (socket_path, G_FILE_TEST_EXISTS))
+  GError *error = NULL;
+
+  /* Try to connect to an already-running helper first.  If that fails
+   * (socket missing or stale), spawn a fresh one and retry. */
+  self->rpc = proton_rpc_new (socket_path, &error);
+  if (!self->rpc)
     {
+      g_clear_error (&error);
+
       gchar *helper = find_helper_binary ();
       if (!helper)
         {
@@ -156,6 +162,9 @@ do_mount (GVfsBackend  *backend,
           g_free (socket_path);
           return;
         }
+
+      /* Remove a stale socket file so the helper can bind cleanly. */
+      unlink (socket_path);
 
       GError *spawn_error = NULL;
       gchar *spawn_argv[] = { helper, "--socket", socket_path, NULL };
@@ -179,10 +188,10 @@ do_mount (GVfsBackend  *backend,
           g_free (socket_path);
           return;
         }
+
+      self->rpc = proton_rpc_new (socket_path, &error);
     }
 
-  GError *error = NULL;
-  self->rpc = proton_rpc_new (socket_path, &error);
   g_free (socket_path);
 
   if (!self->rpc)
