@@ -211,6 +211,14 @@ class SetupWindow(Gtk.ApplicationWindow):
     # ----- captcha page -----
 
     def _show_captcha(self, hv_token):
+        print(f'[setup] _show_captcha called, WebKit={WebKit}', file=sys.stderr)
+        try:
+            self._show_captcha_inner(hv_token)
+        except Exception:
+            import traceback; traceback.print_exc()
+            self._show_err('Failed to display CAPTCHA — see terminal for details.')
+
+    def _show_captcha_inner(self, hv_token):
         if WebKit is None:
             self._show_err('webkitgtk not installed — cannot display CAPTCHA.\n'
                            'Install gir1.2-webkitgtk-6.0 or gir1.2-webkit2-4.1.')
@@ -262,12 +270,16 @@ window.addEventListener('message', function(e) {
         else:
             box.pack_start(wv, True, True, 0)
 
+        # GTK3: widgets must be shown before Stack can display them.
+        # show_all() here, before add_named/set_visible_child_name.
+        if not GTK4:
+            box.show_all()
+
         self._stack.add_named(box, 'captcha')
         self._stack.set_visible_child_name('captcha')
         self.set_default_size(480, 520)
         self.set_resizable(True)
-        if not GTK4:
-            box.show_all()
+        print('[setup] captcha page shown', file=sys.stderr)
 
     def _on_captcha_token(self, _mgr, js_result):
         try:
