@@ -5,20 +5,88 @@ A native GNOME integration for Proton Drive, exposing it as a mounted volume wit
 ## Architecture
 
 ```
-gvfsd-proton (C, GVfs backend)       ← to be implemented
-    ↕ Unix socket (line-delimited JSON-RPC)
-proton-drive-helper (Go binary)       ← this repo
-    ↕ HTTPS + E2E encryption
+Nautilus / GTK file choosers
+        ↕ GVfs VFS ops
+gvfsd-proton  (C, GVfs backend)
+        ↕ Unix socket — line-delimited JSON-RPC
+proton-drive-helper  (Go binary)
+        ↕ HTTPS + E2E encryption
 Proton Drive API
 ```
 
-The Go helper owns authentication, key management, and all Proton Drive API calls using [go-proton-api](https://github.com/ProtonMail/go-proton-api). The C GVfs backend (not yet implemented) will translate GVfs VFS operations into RPC calls to the helper, making Proton Drive appear as a native volume in Nautilus and all GTK file choosers.
+The Go helper owns authentication, key management, and all Proton Drive API calls using [go-proton-api](https://github.com/ProtonMail/go-proton-api). `gvfsd-proton` translates GVfs operations into RPC calls, making the drive appear as a native volume. The backend spawns the helper automatically on mount.
 
-## Helper binary (`helper/`)
+## Building
 
-### RPC protocol
+### Prerequisites
 
-Line-delimited JSON over a Unix socket. Each request and response is a single JSON object terminated by `\n`.
+- Go 1.22+
+- GLib/GIO 2.76+, json-glib 1.0 (headers + dev packages)
+- GVfs 1.57 (runtime libraries: `libgvfsdaemon.so`, `libgvfscommon.so`)
+- Meson 1.0+ and Ninja
+
+### Go helper
+
+```sh
+cd helper
+go build -o proton-drive-helper .
+```
+
+### C backend
+
+```sh
+cd backend
+meson setup build --prefix=/usr/local
+ninja -C build
+meson test -C build    # runs the RPC unit tests
+```
+
+## Installation
+
+```sh
+# helper binary
+sudo cp helper/proton-drive-helper /usr/local/libexec/
+
+# backend binary + mount descriptor
+cd backend && sudo meson install -C build
+# installs: /usr/local/libexec/gvfsd-proton
+#           /usr/local/share/gvfs/mounts/proton.mount
+```
+
+After installing, restart `gvfsd` so it picks up the new mount type:
+
+```sh
+pkill gvfsd; gvfsd &    # or log out and back in
+```
+
+## First mount (read-only)
+
+**1. Store your credentials in the GNOME keyring:**
+
+```sh
+secret-tool store --label="Proton Drive" \
+  schema org.gnome.proton.drive \
+  username you@proton.me
+# enter your Proton password at the prompt
+```
+
+**2. Mount the drive:**
+
+```sh
+gvfs-mount "proton:///?account=you@proton.me&username=you@proton.me"
+```
+
+`gvfsd-proton` will spawn `proton-drive-helper`, wait for the socket, authenticate, and the volume will appear in Nautilus as **Proton Drive**. Opening files and browsing directories works read-only at this stage.
+
+**To unmount:**
+
+```sh
+gvfs-mount -u "proton:///?account=you@proton.me&username=you@proton.me"
+```
+
+## RPC protocol reference
+
+Line-delimited JSON over a Unix socket (`/run/user/<uid>/proton-drive-<account>.sock`). Each request and response is one JSON object terminated by `\n`.
 
 **Request:**
 ```json
@@ -43,9 +111,9 @@ Line-delimited JSON over a Unix socket. Each request and response is a single JS
 | `ListDir` | `{path}` | List active children of a directory |
 | `Stat` | `{path}` | Get metadata for a file or directory |
 | `ReadFile` | `{path, offset, length}` | Read file content (decrypted) |
-| `Mkdir` | `{path}` | Create a directory *(not yet implemented)* |
+| `Mkdir` | `{path}` | Create a directory *(blocked — see limitations)* |
 | `Delete` | `{path, trash}` | Delete or trash a file/directory |
-| `Move` | `{src, dst}` | Move or rename *(not yet implemented)* |
+| `Move` | `{src, dst}` | Move or rename *(blocked — see limitations)* |
 
 ### Error codes
 
@@ -57,23 +125,6 @@ Line-delimited JSON over a Unix socket. Each request and response is a single JS
 | `-32002` | Authentication failed |
 | `-32003` | Not authenticated |
 
-### Build
-
-Requires Go 1.26+.
-
-```sh
-cd helper
-go build -o proton-drive-helper .
-```
-
-### Run
-
-```sh
-./proton-drive-helper --socket /run/user/1000/proton-drive.sock
-```
-
-Then send an `Auth` request before any other method.
-
 ## Status
 
 | Feature | Status |
@@ -83,15 +134,18 @@ Then send an `Auth` request before any other method.
 | Stat file/directory | ✅ |
 | Read file (decrypted) | ✅ |
 | Delete / trash | ✅ |
-| Create directory | ⏳ Pending key generation helpers in go-proton-api |
-| Move / rename | ⏳ MoveLink not yet in go-proton-api |
+| GVfs C backend (read-only) | ✅ |
+| Create directory | ⏳ Pending crypto helpers in go-proton-api |
+| Move / rename | ⏳ `MoveLink` not yet in go-proton-api |
 | Write file | ⏳ Block upload + revision creation |
-| GVfs C backend | 🔲 Not started |
 | GNOME volume monitor | 🔲 Not started |
 | Two-way sync / event polling | 🔲 Not started |
+| Credential setup wizard (GTK) | 🔲 Not started |
+| GNOME Online Accounts integration | 🔲 Future (post-M3) |
 
 ## Known limitations
 
-- `Mkdir` and `Move` are stubbed — `go-proton-api` does not yet expose the crypto helpers needed to generate a new node's `NodeKey`/`NodePassphrase` pair, nor a `MoveLink` endpoint.
-- Path resolution walks the tree on every call (no persistent cache). A production implementation should maintain a linkID cache invalidated by Drive events.
-- `ReadFile` buffers the entire file in memory before applying the offset/length window. Streaming block decryption is needed for large files.
+- **Read-only.** Write operations (`Mkdir`, `Move`, `WriteFile`) are stubbed pending `go-proton-api` additions: key generation for new nodes, `MoveLink`, and block upload helpers.
+- **Manual credential setup.** Credentials must be stored with `secret-tool` for now. A GTK setup wizard is planned (track A2 in ROADMAP.md).
+- **Path resolution is uncached.** The helper walks the tree on every call. A production implementation should keep a linkID cache invalidated by Drive events.
+- **`ReadFile` buffers in memory.** The entire block set is decrypted before slicing to the requested window. Streaming decryption is needed for large files.
