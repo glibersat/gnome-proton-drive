@@ -30,12 +30,31 @@ message('GVfs mount dir   : ' + gvfs_mount_dir)
 
 # GVfs daemon private library — not installed with headers, so we vendor
 # the headers from the matching source tree under gvfs-headers/.
-gvfs_daemon_lib  = cc.find_library('gvfsdaemon',
-  dirs: ['/usr/lib/x86_64-linux-gnu/gvfs'],
-)
-gvfs_common_lib  = cc.find_library('gvfscommon',
-  dirs: ['/usr/lib/x86_64-linux-gnu/gvfs'],
-)
+# The library dir is not in the default ld.so path; we bake it as RPATH.
+gvfs_lib_dir = get_option('gvfs-lib-dir')
+if gvfs_lib_dir == ''
+  # pkg-config does not expose the private lib dir; search common locations.
+  _multiarch = run_command('dpkg-architecture', '-qDEB_HOST_MULTIARCH',
+                           check: false).stdout().strip()
+  _candidates = [
+    gvfs_backend_dir,
+    '/usr/lib/' + _multiarch + '/gvfs',
+    '/usr/lib64/gvfs',
+    '/usr/lib/gvfs',
+  ]
+  foreach _d : _candidates
+    if gvfs_lib_dir == '' and cc.find_library('gvfsdaemon', dirs: [_d], required: false).found()
+      gvfs_lib_dir = _d
+    endif
+  endforeach
+endif
+if gvfs_lib_dir == ''
+  error('Could not find libgvfsdaemon.so — set -Dgvfs-lib-dir=<path>')
+endif
+message('GVfs lib dir     : ' + gvfs_lib_dir)
+
+gvfs_daemon_lib  = cc.find_library('gvfsdaemon', dirs: [gvfs_lib_dir])
+gvfs_common_lib  = cc.find_library('gvfscommon',  dirs: [gvfs_lib_dir])
 
 gvfs_headers_inc = include_directories('gvfs-headers')
 backend_inc      = include_directories('.')
@@ -61,6 +80,7 @@ gvfsd_proton = executable(
                  gvfs_daemon_lib, gvfs_common_lib],
   install: true,
   install_dir: gvfs_backend_dir,
+  install_rpath: gvfs_lib_dir,
 )
 
 # Mount descriptor — Exec path points into the GVfs backend dir

@@ -1,3 +1,8 @@
+option('gvfs-lib-dir',
+  type: 'string', value: '',
+  description: 'Directory containing libgvfsdaemon.so and libgvfscommon.so '
+             + '(baked as RPATH; default: same as gvfs-backend-dir)')
+
 option('gvfs-backend-dir',
   type: 'string', value: '',
   description: 'Directory where GVfs daemon backends are installed '
