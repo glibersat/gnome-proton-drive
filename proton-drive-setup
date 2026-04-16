@@ -2,30 +2,82 @@
 """
 proton-drive-setup — Proton Drive credential wizard (A2 milestone).
 
-GTK4 dialog that authenticates via proton-drive-helper (SRP), handles
+GTK dialog that authenticates via proton-drive-helper (SRP), handles
 CAPTCHA challenges with a native WebKitWebView, then stores the session
 tokens in the GNOME keyring.  The password is never written to disk.
 
-Requirements: python3-gi gir1.2-gtk-4.0
-              gir1.2-webkitgtk-6.0  (or gir1.2-webkit2-4.1)
-              proton-drive-helper secret-tool
+Requirements: python3-gi
+              gir1.2-webkitgtk-6.0  → uses GTK4
+              gir1.2-webkit2-4.1    → uses GTK3 (fallback)
+              proton-drive-helper  secret-tool
 """
 
-import gi
-gi.require_version('Gtk', '4.0')
+import gi, sys
 
-for _ns, _ver in [('WebKit', '6.0'), ('WebKit2', '4.1')]:
+# Probe WebKit BEFORE requiring any Gtk version: WebKit2 4.1 pulls in GTK3,
+# and WebKit 6.0 pulls in GTK4.  Mixing versions raises ImportError.
+_webkit_ns = None
+_gtk_ver = '4.0'
+for _ns, _wkver, _gver in [('WebKit', '6.0', '4.0'), ('WebKit2', '4.1', '3.0')]:
     try:
-        gi.require_version(_ns, _ver)
-        exec(f'from gi.repository import {_ns} as WebKit')
+        gi.require_version(_ns, _wkver)
+        _webkit_ns, _gtk_ver = _ns, _gver
         break
-    except (ValueError, ImportError):
-        WebKit = None
+    except ValueError:
+        pass
 
+gi.require_version('Gtk', _gtk_ver)
 from gi.repository import Gtk, GLib
-import json, os, shutil, socket as _socket, subprocess, sys, tempfile, threading, time, urllib.parse
+
+if _webkit_ns:
+    import importlib
+    WebKit = importlib.import_module(f'gi.repository.{_webkit_ns}')
+else:
+    WebKit = None
+
+GTK4 = _gtk_ver == '4.0'
+
+import json, os, shutil, socket as _socket, subprocess, tempfile, threading, time, urllib.parse
 
 PROTON_API = 'https://mail.proton.me/api'
+
+# ---------- GTK3/4 shims ----------
+
+def _add(box, child):
+    if GTK4:
+        box.append(child)
+    else:
+        box.pack_start(child, False, False, 0)
+
+def _set_child(window, child):
+    if GTK4:
+        window.set_child(child)
+    else:
+        window.add(child)
+
+def _password_entry():
+    if GTK4:
+        e = Gtk.PasswordEntry()
+        e.set_show_peek_icon(True)
+    else:
+        e = Gtk.Entry()
+        e.set_visibility(False)
+        e.set_input_purpose(Gtk.InputPurpose.PASSWORD)
+    return e
+
+def _show_info(parent, title, detail):
+    try:                              # GTK 4.10+
+        dlg = Gtk.AlertDialog()
+        dlg.set_message(title)
+        dlg.set_detail(detail)
+        dlg.show(parent)
+    except AttributeError:            # GTK3 / older GTK4
+        dlg = Gtk.MessageDialog(parent=parent, modal=True,
+                                message_type=Gtk.MessageType.INFO,
+                                buttons=Gtk.ButtonsType.OK, text=title)
+        dlg.format_secondary_text(detail)
+        dlg.connect('response', lambda d, _: d.destroy())
+        dlg.show()
 
 # ---------- helpers ----------
 
@@ -63,7 +115,6 @@ def secret_store(label, username, field, value):
         input=value.encode(), check=True,
     )
 
-
 # ---------- window ----------
 
 class SetupWindow(Gtk.ApplicationWindow):
@@ -79,48 +130,57 @@ class SetupWindow(Gtk.ApplicationWindow):
         self._stack = Gtk.Stack()
         self._stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
         self._stack.set_transition_duration(150)
-        self.set_child(self._stack)
+        _set_child(self, self._stack)
         self._build_login_page()
+
+    def present(self):
+        super().present()
+        if not GTK4:
+            self.show_all()
 
     # ----- login page -----
 
     def _build_login_page(self):
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
-                      margin_top=28, margin_bottom=28,
-                      margin_start=36, margin_end=36)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_margin_top(28)
+        box.set_margin_bottom(28)
+        box.set_margin_start(36)
+        box.set_margin_end(36)
 
         lbl = Gtk.Label()
         lbl.set_markup('<b>Sign in to Proton Drive</b>')
         lbl.set_margin_bottom(4)
-        box.append(lbl)
+        _add(box, lbl)
 
         self._email = Gtk.Entry()
         self._email.set_placeholder_text('Email address')
-        self._email.connect('activate', lambda _: self._pass.grab_focus())
-        box.append(self._email)
+        self._email.connect('activate', lambda _: self._pass_w.grab_focus())
+        _add(box, self._email)
 
-        self._pass = Gtk.PasswordEntry()
-        self._pass.set_show_peek_icon(True)
-        self._pass.connect('activate', self._on_sign_in)
-        box.append(self._pass)
+        self._pass_w = _password_entry()
+        if GTK4:
+            self._pass_w.connect('activate', self._on_sign_in)
+        else:
+            self._pass_w.connect('activate', self._on_sign_in)
+        _add(box, self._pass_w)
 
         self._err = Gtk.Label(label='')
-        self._err.add_css_class('error')
         self._err.set_visible(False)
-        self._err.set_wrap(True)
-        box.append(self._err)
+        self._err.set_line_wrap(True)
+        _add(box, self._err)
 
         self._btn = Gtk.Button(label='Sign in')
-        self._btn.add_css_class('suggested-action')
+        if GTK4:
+            self._btn.add_css_class('suggested-action')
         self._btn.connect('clicked', self._on_sign_in)
-        box.append(self._btn)
+        _add(box, self._btn)
 
         self._stack.add_named(box, 'login')
         self._stack.set_visible_child_name('login')
 
     def _on_sign_in(self, *_):
         username = self._email.get_text().strip()
-        password = self._pass.get_text()
+        password = self._pass_w.get_text() if GTK4 else self._pass_w.get_text()
         if not username or not password:
             self._show_err('Email and password are required.')
             return
@@ -176,13 +236,18 @@ window.addEventListener('message', function(e) {
         note = Gtk.Label(label='Complete the verification to continue.')
         note.set_margin_top(8)
         note.set_margin_bottom(4)
-        box.append(note)
-        box.append(wv)
+        _add(box, note)
+        if GTK4:
+            box.append(wv)
+        else:
+            box.pack_start(wv, True, True, 0)
 
         self._stack.add_named(box, 'captcha')
         self._stack.set_visible_child_name('captcha')
         self.set_default_size(480, 520)
         self.set_resizable(True)
+        if not GTK4:
+            box.show_all()
 
     def _on_captcha_token(self, _mgr, js_result):
         try:
@@ -197,7 +262,8 @@ window.addEventListener('message', function(e) {
         try:
             helper = find_helper()
             if not helper:
-                GLib.idle_add(self._show_err, 'proton-drive-helper not found.\n'
+                GLib.idle_add(self._show_err,
+                              'proton-drive-helper not found.\n'
                               'Build it: cd helper && go build -o proton-drive-helper .')
                 return
 
@@ -247,22 +313,21 @@ window.addEventListener('message', function(e) {
         u = self._username
         try:
             secret_store(f'Proton Drive session UID ({u})', u, 'uid', result['uid'])
-            secret_store(f'Proton Drive refresh token ({u})', u, 'refresh_token', result['refresh_token'])
+            secret_store(f'Proton Drive refresh token ({u})', u,
+                         'refresh_token', result['refresh_token'])
             # salted_passphrase is already base64 from JSON; stored as-is so
             # do_mount can g_base64_decode() it directly.
-            secret_store(f'Proton Drive key passphrase ({u})', u, 'salted_passphrase', result['salted_passphrase'])
+            secret_store(f'Proton Drive key passphrase ({u})', u,
+                         'salted_passphrase', result['salted_passphrase'])
         except Exception as e:
             self._show_err(f'Failed to store credentials: {e}')
             return
 
         self._cleanup()
-
-        dlg = Gtk.AlertDialog()
-        dlg.set_message('Setup complete')
-        dlg.set_detail(f'Signed in as {u}.\n\n'
-                       'Proton Drive will appear in Nautilus after the next mount.\n\n'
-                       'To mount now:\n  gvfs-mount "proton:///"')
-        dlg.show(self)
+        _show_info(self, 'Setup complete',
+                   f'Signed in as {u}.\n\n'
+                   'Proton Drive will appear in Nautilus after the next mount.\n\n'
+                   'To mount now:\n  gvfs-mount "proton:///"')
         self.close()
 
     # ----- utils -----
