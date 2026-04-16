@@ -61,29 +61,19 @@ pkill gvfsd; gvfsd &    # or log out and back in
 
 ## First mount (read-only)
 
-**1. Authenticate and store session tokens in the GNOME keyring:**
-
-The setup wizard (planned, not yet built) will handle this automatically.
-For now, use the helper binary directly to perform the initial SRP login
-and capture the returned tokens:
+**1. Run the setup script:**
 
 ```sh
-# Authenticate once to capture uid, refresh_token, and salted_passphrase
-./proton-drive-helper --socket /tmp/setup.sock &
-echo '{"id":1,"method":"Auth","params":{"username":"you@proton.me","password":"YOUR_PASSWORD"}}' \
-  | nc -U /tmp/setup.sock | jq .
-
-# Store the three token fields from the response — not the password
-secret-tool store --label="Proton Drive uid" \
-  schema org.gnome.proton.drive username you@proton.me field uid
-secret-tool store --label="Proton Drive refresh_token" \
-  schema org.gnome.proton.drive username you@proton.me field refresh_token
-secret-tool store --label="Proton Drive salted_passphrase" \
-  schema org.gnome.proton.drive username you@proton.me field salted_passphrase
+./proton-drive-setup
 ```
 
-The password is only used during the initial `Auth` call and is never stored.
-Subsequent mounts use `ResumeSession` with the stored tokens.
+This opens a zenity dialog asking for your email and password, performs
+SRP login via `proton-drive-helper`, and stores the session tokens
+(`uid`, `refresh_token`, `salted_passphrase`) in the GNOME keyring.
+The password is never written to disk.
+
+*Requires: `zenity`, `jq`, `python3`, `secret-tool`, and
+`proton-drive-helper` built and reachable from the project root.*
 
 **2. Mount the drive:**
 
