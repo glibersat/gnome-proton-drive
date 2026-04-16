@@ -33,11 +33,15 @@ gboolean    proton_rpc_auth         (ProtonRpc    *rpc,
                                      GError      **error);
 
 /* Resume a session from stored credentials — no password needed.
- * Called by do_mount on every mount. */
+ * Called by do_mount on every mount. On success, out_new_uid and
+ * out_new_refresh_token hold the rotated credentials that must be
+ * persisted back to libsecret. */
 gboolean    proton_rpc_resume_session (ProtonRpc    *rpc,
                                        const gchar  *uid,
                                        const gchar  *refresh_token,
                                        GBytes       *salted_passphrase,
+                                       gchar       **out_new_uid,
+                                       gchar       **out_new_refresh_token,
                                        GError      **error);
 
 /* Returns a NULL-terminated array of ProtonEntry* owned by the caller.

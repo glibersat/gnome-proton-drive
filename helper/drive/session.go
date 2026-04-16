@@ -86,11 +86,12 @@ func NewSession(ctx context.Context, mgr *proton.Manager, username, password str
 	}, creds, nil
 }
 
-// NewSessionWithHV retries SRP login after the user completes a CAPTCHA.
-// hvToken is the hCaptcha response token captured from the browser page.
-func NewSessionWithHV(ctx context.Context, mgr *proton.Manager, username, password, hvToken string) (*Session, SessionCredentials, error) {
+// NewSessionWithHV retries SRP login after the user completes a human
+// verification challenge. hvType is the method used ("captcha", "email",
+// "sms") and hvToken is the solved token or delivered code.
+func NewSessionWithHV(ctx context.Context, mgr *proton.Manager, username, password, hvToken, hvType string) (*Session, SessionCredentials, error) {
 	hv := &proton.APIHVDetails{
-		Methods: []string{"captcha"},
+		Methods: []string{hvType},
 		Token:   hvToken,
 	}
 	c, auth, err := mgr.NewClientWithLoginWithHVToken(ctx, username, []byte(password), hv)
@@ -126,31 +127,36 @@ func NewSessionWithHV(ctx context.Context, mgr *proton.Manager, username, passwo
 
 // ResumeSession restores a fully authenticated session from the three values
 // stored in the keyring — no SRP re-auth needed.
-func ResumeSession(ctx context.Context, mgr *proton.Manager, creds SessionCredentials) (*Session, error) {
-	c, _, err := mgr.NewClientWithRefresh(ctx, creds.UID, creds.RefreshToken)
+func ResumeSession(ctx context.Context, mgr *proton.Manager, creds SessionCredentials) (*Session, SessionCredentials, error) {
+	c, auth, err := mgr.NewClientWithRefresh(ctx, creds.UID, creds.RefreshToken)
 	if err != nil {
-		return nil, fmt.Errorf("token refresh failed: %w", err)
+		return nil, SessionCredentials{}, fmt.Errorf("token refresh failed: %w", err)
 	}
 
 	addrKR, err := unlockWithSaltedPassphrase(ctx, c, creds.SaltedPassphrase)
 	if err != nil {
 		_ = c.AuthDelete(ctx)
-		return nil, err
+		return nil, SessionCredentials{}, err
 	}
 
 	shareID, rootID, err := findMainShare(ctx, c)
 	if err != nil {
 		_ = c.AuthDelete(ctx)
-		return nil, err
+		return nil, SessionCredentials{}, err
 	}
 
+	newCreds := SessionCredentials{
+		UID:              auth.UID,
+		RefreshToken:     auth.RefreshToken,
+		SaltedPassphrase: creds.SaltedPassphrase,
+	}
 	return &Session{
 		client:  c,
 		shareID: shareID,
 		rootID:  rootID,
 		addrKR:  addrKR,
 		nodeKRs: make(map[string]*crypto.KeyRing),
-	}, nil
+	}, newCreds, nil
 }
 
 func (s *Session) Close(ctx context.Context) error {

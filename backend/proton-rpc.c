@@ -177,6 +177,8 @@ proton_rpc_resume_session (ProtonRpc    *rpc,
                             const gchar  *uid,
                             const gchar  *refresh_token,
                             GBytes       *salted_passphrase,
+                            gchar       **out_new_uid,
+                            gchar       **out_new_refresh_token,
                             GError      **error)
 {
   gsize        sp_len;
@@ -195,7 +197,16 @@ proton_rpc_resume_session (ProtonRpc    *rpc,
   g_free (sp_b64);
 
   g_autoptr(JsonObject) resp = call (rpc, "ResumeSession", b, error);
-  return resp != NULL;
+  if (!resp)
+    return FALSE;
+
+  JsonObject *result = json_object_get_object_member (resp, "result");
+  if (out_new_uid)
+    *out_new_uid = g_strdup (json_object_get_string_member (result, "uid"));
+  if (out_new_refresh_token)
+    *out_new_refresh_token = g_strdup (json_object_get_string_member (result, "refresh_token"));
+
+  return TRUE;
 }
 
 ProtonEntry **

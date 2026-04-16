@@ -172,7 +172,7 @@ test_resume_session (void)
   ProtonRpc *rpc    = proton_rpc_new (srv->socket_path, &error);
   g_assert_nonnull (rpc);
 
-  gboolean ok = proton_rpc_resume_session (rpc, "uid-abc", "tok-xyz", sp, &error);
+  gboolean ok = proton_rpc_resume_session (rpc, "uid-abc", "tok-xyz", sp, NULL, NULL, &error);
   g_assert_no_error (error);
   g_assert_true (ok);
 

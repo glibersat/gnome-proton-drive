@@ -89,13 +89,18 @@ func main() {
 		return rpc.GetCaptchaResult{HTML: string(html)}, nil
 	})
 
-	// AuthWithHV retries SRP login with the hCaptcha response token.
+	// AuthWithHV retries SRP login after the user completes a human verification
+	// challenge.  p.Type selects the method: "captcha", "email", or "sms".
 	srv.Register("AuthWithHV", func(ctx context.Context, raw json.RawMessage) (any, error) {
 		var p rpc.AuthWithHVParams
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, &rpc.RPCError{Code: rpc.ErrInvalidArg, Message: err.Error()}
 		}
-		s, creds, err := drive.NewSessionWithHV(ctx, mgr, p.Username, p.Password, p.HVToken)
+		hvType := p.Type
+		if hvType == "" {
+			hvType = "captcha"
+		}
+		s, creds, err := drive.NewSessionWithHV(ctx, mgr, p.Username, p.Password, p.HVToken, hvType)
 		if err != nil {
 			return nil, &rpc.RPCError{Code: rpc.ErrAuthFailed, Message: err.Error()}
 		}
@@ -107,6 +112,28 @@ func main() {
 		}, nil
 	})
 
+	// SendCode asks Proton to deliver a verification code to the user's email
+	// address or phone number. The user then enters the code and retries via
+	// AuthWithHV with the matching type.
+	srv.Register("SendCode", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		var p rpc.SendCodeParams
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, &rpc.RPCError{Code: rpc.ErrInvalidArg, Message: err.Error()}
+		}
+		dest := proton.TokenDestination{
+			Address: p.Address,
+		}
+		err := mgr.SendVerificationCode(ctx, proton.SendVerificationCodeReq{
+			Username:    p.Username,
+			Type:        proton.TokenType(p.Type),
+			Destination: dest,
+		})
+		if err != nil {
+			return nil, &rpc.RPCError{Code: rpc.ErrInternal, Message: err.Error()}
+		}
+		return map[string]bool{"ok": true}, nil
+	})
+
 	// ResumeSession restores a session from stored credentials — no password.
 	// This is what gvfsd-proton calls on every mount.
 	srv.Register("ResumeSession", func(ctx context.Context, raw json.RawMessage) (any, error) {
@@ -114,7 +141,7 @@ func main() {
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, &rpc.RPCError{Code: rpc.ErrInvalidArg, Message: err.Error()}
 		}
-		s, err := drive.ResumeSession(ctx, mgr, drive.SessionCredentials{
+		s, creds, err := drive.ResumeSession(ctx, mgr, drive.SessionCredentials{
 			UID:              p.UID,
 			RefreshToken:     p.RefreshToken,
 			SaltedPassphrase: p.SaltedPassphrase,
@@ -123,7 +150,11 @@ func main() {
 			return nil, &rpc.RPCError{Code: rpc.ErrAuthFailed, Message: err.Error()}
 		}
 		session = s
-		return map[string]bool{"ok": true}, nil
+		return rpc.AuthResult{
+			UID:              creds.UID,
+			RefreshToken:     creds.RefreshToken,
+			SaltedPassphrase: creds.SaltedPassphrase,
+		}, nil
 	})
 
 	srv.Register("ListDir", func(ctx context.Context, raw json.RawMessage) (any, error) {
@@ -141,15 +172,19 @@ func main() {
 			return nil, err
 		}
 
+		log.Printf("ListDir %q: %d raw links from API", p.Path, len(links))
 		result := rpc.ListDirResult{Entries: make([]rpc.Entry, 0, len(links))}
 		for _, l := range links {
 			if l.State != proton.LinkStateActive {
+				log.Printf("  skip %s: state=%d", l.LinkID, l.State)
 				continue
 			}
 			name, err := l.GetName(parentKR, s.AddrKR())
 			if err != nil {
+				log.Printf("  skip %s: GetName error: %v", l.LinkID, err)
 				continue
 			}
+			log.Printf("  entry %q dir=%v size=%d", name, l.Type == proton.LinkTypeFolder, l.Size)
 			result.Entries = append(result.Entries, rpc.Entry{
 				Name:  name,
 				IsDir: l.Type == proton.LinkTypeFolder,

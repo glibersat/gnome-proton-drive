@@ -51,6 +51,44 @@ fill_file_info (GFileInfo *info, ProtonEntry *e)
   g_date_time_unref (dt);
 }
 
+/* ---------- libsecret helpers ---------- */
+
+/* Store @secret under the given field for @username via secret-tool,
+ * writing the secret to the subprocess stdin so it never appears in argv. */
+static void
+secret_tool_store (const gchar *username, const gchar *field, const gchar *secret)
+{
+  gchar *label = g_strdup_printf ("Proton Drive %s (%s)", field, username);
+  const gchar *argv[] = {
+    "secret-tool", "store", "--label", label,
+    "schema",   "org.gnome.proton.drive",
+    "username", username,
+    "field",    field,
+    NULL
+  };
+
+  GError *err = NULL;
+  GSubprocess *proc = g_subprocess_newv (argv,
+                                         G_SUBPROCESS_FLAGS_STDIN_PIPE |
+                                         G_SUBPROCESS_FLAGS_STDERR_SILENCE,
+                                         &err);
+  g_free (label);
+  if (!proc)
+    {
+      g_warning ("secret-tool store: %s", err->message);
+      g_error_free (err);
+      return;
+    }
+
+  g_subprocess_communicate_utf8 (proc, secret, NULL, NULL, NULL, &err);
+  if (err)
+    {
+      g_warning ("secret-tool store write: %s", err->message);
+      g_error_free (err);
+    }
+  g_object_unref (proc);
+}
+
 /* ---------- helper spawn ---------- */
 
 /* Locate proton-drive-helper: check libexecdir first (both installed there),
@@ -196,7 +234,11 @@ do_mount (GVfsBackend  *backend,
     guchar *sp_data = g_base64_decode (salted_pass_b64, &sp_len);
     GBytes *sp      = g_bytes_new_take (sp_data, sp_len);
 
-    gboolean ok = proton_rpc_resume_session (self->rpc, uid, refresh_token, sp, &error);
+    gchar *new_uid           = NULL;
+    gchar *new_refresh_token = NULL;
+
+    gboolean ok = proton_rpc_resume_session (self->rpc, uid, refresh_token, sp,
+                                             &new_uid, &new_refresh_token, &error);
     g_bytes_unref (sp);
 
     if (!ok)
@@ -205,6 +247,14 @@ do_mount (GVfsBackend  *backend,
         g_error_free (error);
         goto cred_cleanup;
       }
+
+    /* Proton rotates the refresh token on every use — persist the new one. */
+    if (new_uid && new_refresh_token)
+      secret_tool_store (account, "uid",           new_uid);
+    if (new_refresh_token)
+      secret_tool_store (account, "refresh_token", new_refresh_token);
+    g_free (new_uid);
+    g_free (new_refresh_token);
   }
 
   g_free (uid);
