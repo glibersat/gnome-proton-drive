@@ -120,8 +120,7 @@ do_mount (GVfsBackend  *backend,
         }
 
       GError *spawn_error = NULL;
-      gchar *spawn_argv[] = { helper, "--socket", socket_path,
-                               "--account", (gchar *) account, NULL };
+      gchar *spawn_argv[] = { helper, "--socket", socket_path, NULL };
       g_spawn_async (NULL, spawn_argv, NULL,
                      G_SPAWN_DEFAULT, NULL, NULL, NULL, &spawn_error);
       g_free (helper);
