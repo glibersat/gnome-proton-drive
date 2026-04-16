@@ -3,43 +3,33 @@
 proton-drive-setup — Proton Drive credential wizard (A2 milestone).
 
 GTK dialog that authenticates via proton-drive-helper (SRP), handles
-CAPTCHA challenges with a native WebKitWebView, then stores the session
-tokens in the GNOME keyring.  The password is never written to disk.
+CAPTCHA challenges via direct API calls (image puzzle), then stores the
+session tokens in the GNOME keyring.  The password is never written to disk.
 
-Requirements: python3-gi
-              gir1.2-webkitgtk-6.0  → uses GTK4
-              gir1.2-webkit2-4.1    → uses GTK3 (fallback)
+Requirements: python3-gi  gir1.2-gtk-4.0 (or gir1.2-gtk-3.0)
               proton-drive-helper  secret-tool
 """
 
 import gi, sys
 
-# Probe WebKit BEFORE requiring any Gtk version: WebKit2 4.1 pulls in GTK3,
-# and WebKit 6.0 pulls in GTK4.  Mixing versions raises ImportError.
-_webkit_ns = None
+gi.require_version('Gtk', '4.0')
 _gtk_ver = '4.0'
-for _ns, _wkver, _gver in [('WebKit', '6.0', '4.0'), ('WebKit2', '4.1', '3.0')]:
-    try:
-        gi.require_version(_ns, _wkver)
-        _webkit_ns, _gtk_ver = _ns, _gver
-        break
-    except ValueError:
-        pass
+try:
+    from gi.repository import Gtk
+except Exception:
+    gi.require_version('Gtk', '3.0')
+    _gtk_ver = '3.0'
+    from gi.repository import Gtk
 
-gi.require_version('Gtk', _gtk_ver)
-from gi.repository import Gtk, GLib
-
-if _webkit_ns:
-    import importlib
-    WebKit = importlib.import_module(f'gi.repository.{_webkit_ns}')
-else:
-    WebKit = None
-
+from gi.repository import GLib
 GTK4 = _gtk_ver == '4.0'
 
-import json, os, shutil, socket as _socket, subprocess, tempfile, threading, time, urllib.parse
+import base64, hashlib, http.cookiejar, json, math, os, re, shutil
+import socket as _socket, struct, subprocess, tempfile, threading, time
+import urllib.parse, urllib.request, zlib
 
-PROTON_API = 'https://mail.proton.me/api'
+CAPTCHA_API = 'https://verify-api.proton.me'
+APP_VERSION  = 'web-drive@5.0.0'
 
 # ---------- GTK3/4 shims ----------
 
@@ -71,13 +61,208 @@ def _show_info(parent, title, detail):
         dlg.set_message(title)
         dlg.set_detail(detail)
         dlg.show(parent)
-    except AttributeError:            # GTK3 / older GTK4
+    except AttributeError:
         dlg = Gtk.MessageDialog(parent=parent, modal=True,
                                 message_type=Gtk.MessageType.INFO,
                                 buttons=Gtk.ButtonsType.OK, text=title)
         dlg.format_secondary_text(detail)
         dlg.connect('response', lambda d, _: d.destroy())
         dlg.show()
+
+# ---------- captcha API ----------
+# A single cookie jar persists cookies across all captcha calls in one session.
+# The init call sets cookies that the validate call requires.
+_captcha_jar    = http.cookiejar.CookieJar()
+_captcha_opener = urllib.request.build_opener(
+    urllib.request.HTTPCookieProcessor(_captcha_jar))
+
+
+def _captcha_get(path, params=None, extra_headers=None):
+    url = f'{CAPTCHA_API}/{path}'
+    if params:
+        url += '?' + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={
+        'x-pm-appversion': APP_VERSION,
+        'User-Agent': 'Mozilla/5.0',
+    })
+    if extra_headers:
+        for k, v in extra_headers.items():
+            req.add_header(k, v)
+    print(f'[captcha] GET {url}', file=sys.stderr)
+    if extra_headers:
+        for k, v in extra_headers.items():
+            print(f'[captcha]   header {k}: {v}', file=sys.stderr)
+    with _captcha_opener.open(req, timeout=15) as r:
+        body = r.read()
+        print(f'[captcha] response status={r.status} len={len(body)}', file=sys.stderr)
+        if r.headers.get_content_type() == 'application/json':
+            print(f'[captcha] response body: {body.decode("utf-8", errors="replace")}',
+                  file=sys.stderr)
+        return body
+
+
+def captcha_extract_sub_token(captcha_token):
+    """Fetch the captcha JS and extract the sub_token from sendToken(...)."""
+    js = _captcha_get('core/v4/captcha', {
+        'Token': captcha_token,
+        'ForceWebMessaging': '1',
+        'Dark': 'true',
+    }).decode('utf-8', errors='replace')
+    m = re.search(r"sendToken\((.*?)\);", js)
+    if not m:
+        raise RuntimeError('sub_token not found in captcha JS — page format may have changed')
+    # Strip the dynamic "+response" part, then join the literal string fragments
+    expr = m.group(1).replace('+response', '')
+    sub_token = ''.join(re.findall(r"'([^']+)'", expr))
+    print(f'[captcha] sub_token prefix: {sub_token[:8]}…', file=sys.stderr)
+    return sub_token
+
+
+def captcha_init(captcha_token):
+    """Call captcha/v1/api/init and return the init JSON."""
+    parent = (f'{CAPTCHA_API}/core/v4/captcha'
+              f'?Token={urllib.parse.quote(captcha_token)}&ForceWebMessaging=1&Dark=true')
+    data = _captcha_get('captcha/v1/api/init', {
+        'challengeType': '2D',
+        'parentURL': parent,
+        'displayedLang': 'en',
+        'supportedLangs': 'en-US,en-US,en-US,en',
+        'purpose': 'login',
+        'token': captcha_token,
+    })
+    parsed = json.loads(data)
+    # Log full init_data (minus the challenges array body to keep it readable)
+    loggable = {k: (v if k != 'challenges' else f'[{len(v)} items]')
+                for k, v in parsed.items()}
+    print(f'[captcha] init_data: {json.dumps(loggable, indent=2)}', file=sys.stderr)
+    return parsed
+
+
+def captcha_fetch_images(init_token):
+    """Fetch background and puzzle-piece images. Returns (bg_bytes, piece_bytes)."""
+    bg    = _captcha_get('captcha/v1/api/bg',     {'token': init_token})
+    piece = _captcha_get('captcha/v1/api/puzzle',  {'token': init_token})
+    print(f'[captcha] bg={len(bg)}b  piece={len(piece)}b', file=sys.stderr)
+    return bg, piece
+
+
+def _compress_array(arr):
+    """Run-length encode an array the same way the reference client does."""
+    if not arr:
+        return [0]
+    result = []
+    rep = 1
+    last = arr[0]
+    lits = [last]
+    for v in arr[1:]:
+        if v == last:
+            if len(lits) > 1:
+                lits.pop()
+                result.append(-len(lits))
+                result.extend(lits)
+                lits = []
+            rep += 1
+        else:
+            if rep > 1:
+                result.extend([rep, last])
+                rep = 1
+                lits = [v]
+            else:
+                lits.append(v)
+            last = v
+    if len(lits) > 1:
+        result.append(-len(lits))
+        result.extend(lits)
+    elif rep >= 1:
+        result.extend([rep, last])
+    result.append(0)
+    return result
+
+
+def _encode_client_data(xs, ys, buttons, timestamps):
+    """Compress trajectory arrays → zlib → XOR header bytes → base64."""
+    # Timestamps are floats; truncate to int before compressing (matches
+    # the reference's np.array(s, dtype=np.int16) truncation behaviour).
+    ts_int = [int(t) for t in timestamps]
+    combined = (_compress_array(xs) + _compress_array(ys) +
+                _compress_array(buttons) + _compress_array(ts_int))
+    raw = struct.pack(f'<{len(combined)}h', *[int(v) for v in combined])
+    compressed = bytearray(zlib.compress(raw))
+    if len(compressed) > 1:
+        compressed[0] ^= 150
+        compressed[1] ^= 181
+    return base64.b64encode(bytes(compressed)).decode()
+
+
+def captcha_solve_pow(challenges, n_zeros):
+    """SHA-256 proof-of-work using nLeadingZerosRequired from init."""
+    t0 = time.perf_counter()
+    answers = []
+    for challenge in challenges:
+        g = math.ceil(n_zeros / 4)
+        threshold = math.pow(2, 4 * g - n_zeros)
+        a = 0
+        while True:
+            h = hashlib.sha256(f'{a}{challenge}'.encode()).hexdigest()
+            if int(h[:g], 16) < threshold:
+                answers.append(a)
+                break
+            a += 1
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    return answers, elapsed_ms
+
+
+def captcha_validate(init_token, contest_id, x, y, init_data, trajectory):
+    """Build pcaptcha, call validate, then finalize. Returns init_token on success."""
+    challenges = init_data['challenges']
+    n_zeros    = init_data.get('nLeadingZerosRequired', 13)
+
+    xs, ys, buttons, timestamps = trajectory
+
+    t_piece = time.monotonic() * 1000  # rough: all loading already done
+    piece_load_ms     = round(200 + time.monotonic() % 180, 6)
+    bg_load_ms        = piece_load_ms + round(10 + time.monotonic() % 15, 6)
+    challenge_load_ms = bg_load_ms    + round(10 + time.monotonic() % 15, 6)
+    solve_ms          = timestamps[-1] if timestamps else 5000
+
+    print(f'[captcha] solving PoW ({n_zeros} leading zeros, {len(challenges)} challenges)…',
+          file=sys.stderr)
+    answers, pow_ms = captcha_solve_pow(challenges, n_zeros)
+
+    client_data = _encode_client_data(xs, ys, buttons, timestamps)
+
+    payload = {
+        'x': x, 'y': y,
+        'answers': answers,
+        'clientData': client_data,
+        'pieceLoadElapsedMs':     piece_load_ms,
+        'bgLoadElapsedMs':        bg_load_ms,
+        'challengeLoadElapsedMs': challenge_load_ms,
+        'solveChallengeMs':       solve_ms,
+        'powElapsedMs':           solve_ms + pow_ms,
+    }
+    pcaptcha = json.dumps(payload, separators=(',', ':'))
+    print(f'[captcha] pcaptcha x={x} y={y} answers={answers} clientData={client_data[:16]}…',
+          file=sys.stderr)
+
+    _captcha_get('captcha/v1/api/validate', {
+        'token': init_token,
+        'contestId': contest_id,
+        'purpose': 'login',
+    }, extra_headers={'pcaptcha': pcaptcha})
+
+    # Finalize is required after a successful validate
+    _captcha_get('captcha/v1/api/finalize', {
+        'contestId': contest_id,
+        'purpose': 'login',
+    })
+
+    return init_token
+
+
+def build_hv_token(captcha_token, sub_token, proved_token):
+    """Compose the x-pm-human-verification-token value."""
+    return f'{captcha_token}:{sub_token}{proved_token}'
 
 # ---------- helpers ----------
 
@@ -115,7 +300,195 @@ def secret_store(label, username, field, value):
         input=value.encode(), check=True,
     )
 
-# ---------- window ----------
+# ---------- captcha window ----------
+
+def _load_pixbuf(image_bytes):
+    from gi.repository import GdkPixbuf
+    loader = GdkPixbuf.PixbufLoader()
+    loader.write(image_bytes)
+    loader.close()
+    return loader.get_pixbuf()
+
+
+class CaptchaWindow(Gtk.Window):
+    """
+    Drag-to-place puzzle window.
+
+    Shows the background image (with the hole) and the puzzle piece.
+    The piece is dragged horizontally to fit the hole; y is constrained to
+    the piece's starting row so only one axis matters to the server.
+
+    Calls on_solved(x, y) with the piece's top-left corner coordinates when
+    the user releases the drag.  No intermediate coordinates are needed.
+    """
+
+    def __init__(self, bg_bytes, piece_bytes, on_solved, on_error):
+        from gi.repository import GdkPixbuf
+        self._bg    = _load_pixbuf(bg_bytes)
+        self._piece = _load_pixbuf(piece_bytes) if piece_bytes else None
+
+        bw = self._bg.get_width()
+        bh = self._bg.get_height()
+        pw = self._piece.get_width()  if self._piece else 0
+        ph = self._piece.get_height() if self._piece else 0
+        print(f'[captcha] bg={bw}×{bh}  piece={pw}×{ph}', file=sys.stderr)
+
+        super().__init__(title='Complete verification — Proton Drive',
+                         default_width=bw + 24, default_height=bh + 60,
+                         resizable=False)
+        self._on_solved  = on_solved
+        self._on_error   = on_error
+        self._bw, self._bh = bw, bh
+        self._pw, self._ph = pw, ph
+
+        # Piece starts at the left edge; y is centred vertically in the image.
+        self._piece_x  = 0
+        self._piece_y  = (bh - ph) // 2 if ph else 0
+        self._drag_origin_x = None   # piece_x at drag start
+        self._drag_origin_y = None   # piece_y at drag start
+        self._drag_start_x  = None   # cursor x at drag start (GTK3)
+        self._drag_start_y  = None   # cursor y at drag start (GTK3)
+        self._t0            = None   # monotonic ms at drag start
+        # trajectory lists (widget-local coords, button=1 during drag)
+        self._traj_x   = []
+        self._traj_y   = []
+        self._traj_btn = []
+        self._traj_ts  = []
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        vbox.set_margin_top(8); vbox.set_margin_bottom(8)
+        vbox.set_margin_start(12); vbox.set_margin_end(12)
+
+        if self._piece:
+            lbl_text = '<b>Drag the piece to fill the gap, then release.</b>'
+        else:
+            lbl_text = '<b>Click where the puzzle piece fits.</b>'
+        lbl = Gtk.Label()
+        lbl.set_markup(lbl_text)
+        lbl.set_margin_bottom(4)
+
+        self._da = Gtk.DrawingArea()
+        self._da.set_size_request(bw, bh)
+
+        if GTK4:
+            vbox.append(lbl)
+            self._da.set_draw_func(self._draw_gtk4)
+            drag = Gtk.GestureDrag()
+            drag.connect('drag-begin',  self._drag_begin_gtk4)
+            drag.connect('drag-update', self._drag_update_gtk4)
+            drag.connect('drag-end',    self._drag_end_gtk4)
+            self._da.add_controller(drag)
+            vbox.append(self._da)
+            self.set_child(vbox)
+        else:
+            from gi.repository import Gdk
+            vbox.pack_start(lbl, False, False, 0)
+            self._da.connect('draw', self._draw_gtk3)
+            self._da.add_events(
+                Gdk.EventMask.BUTTON_PRESS_MASK |
+                Gdk.EventMask.BUTTON_RELEASE_MASK |
+                Gdk.EventMask.POINTER_MOTION_MASK)
+            self._da.connect('button-press-event',   self._press_gtk3)
+            self._da.connect('motion-notify-event',  self._motion_gtk3)
+            self._da.connect('button-release-event', self._release_gtk3)
+            vbox.pack_start(self._da, False, False, 0)
+            self.add(vbox)
+            self.show_all()
+
+    # ---- drawing ----
+
+    def _draw_gtk4(self, _da, cr, _w, _h):
+        self._paint(cr)
+
+    def _draw_gtk3(self, _da, cr):
+        self._paint(cr)
+
+    def _paint(self, cr):
+        from gi.repository import Gdk
+        Gdk.cairo_set_source_pixbuf(cr, self._bg, 0, 0)
+        cr.paint()
+        if self._piece:
+            Gdk.cairo_set_source_pixbuf(cr, self._piece, self._piece_x, self._piece_y)
+            cr.paint()
+
+    # ---- GTK4 drag ----
+
+    def _drag_begin_gtk4(self, gesture, x, y):
+        self._drag_origin_x = self._piece_x
+        self._drag_origin_y = self._piece_y
+        self._start_trajectory(x, y)
+
+    def _drag_update_gtk4(self, gesture, dx, dy):
+        if self._drag_origin_x is None:
+            return
+        self._move_piece(self._drag_origin_x + dx, self._drag_origin_y + dy)
+        _ok, sx, sy = gesture.get_start_point()
+        self._record(sx + dx, sy + dy, 1)
+
+    def _drag_end_gtk4(self, gesture, dx, dy):
+        if self._drag_origin_x is None:
+            return
+        self._move_piece(self._drag_origin_x + dx, self._drag_origin_y + dy)
+        self._submit()
+
+    # ---- GTK3 drag ----
+
+    def _press_gtk3(self, _w, event):
+        self._drag_origin_x = self._piece_x
+        self._drag_origin_y = self._piece_y
+        self._drag_start_x  = event.x
+        self._drag_start_y  = event.y
+        self._start_trajectory(event.x, event.y)
+
+    def _motion_gtk3(self, _w, event):
+        if self._drag_origin_x is None:
+            return
+        self._move_piece(self._drag_origin_x + (event.x - self._drag_start_x),
+                         self._drag_origin_y + (event.y - self._drag_start_y))
+        self._record(event.x, event.y, 1)
+
+    def _release_gtk3(self, _w, event):
+        self._record(event.x, event.y, 0)
+        self._drag_origin_x = None
+        self._drag_origin_y = None
+        self._submit()
+
+    # ---- trajectory helpers ----
+
+    def _start_trajectory(self, x, y):
+        self._t0        = time.monotonic() * 1000
+        self._traj_x    = [int(x)]
+        self._traj_y    = [int(y)]
+        self._traj_btn  = [1]
+        self._traj_ts   = [0]
+
+    def _record(self, x, y, btn):
+        if self._t0 is None:
+            return
+        self._traj_x.append(int(x))
+        self._traj_y.append(int(y))
+        self._traj_btn.append(btn)
+        self._traj_ts.append(round(time.monotonic() * 1000 - self._t0, 4))
+
+    # ---- move / submit ----
+
+    def _move_piece(self, new_x, new_y=None):
+        max_x = self._bw - self._pw if self._pw else self._bw
+        max_y = self._bh - self._ph if self._ph else self._bh
+        self._piece_x = max(0, min(int(new_x), max_x))
+        if new_y is not None:
+            self._piece_y = max(0, min(int(new_y), max_y))
+        self._da.queue_draw()
+
+    def _submit(self):
+        x, y = self._piece_x, self._piece_y
+        traj = (self._traj_x, self._traj_y, self._traj_btn, self._traj_ts)
+        print(f'[captcha] submitting x={x} y={y} trajectory_points={len(self._traj_x)}',
+              file=sys.stderr)
+        self.close()
+        self._on_solved(x, y, traj)
+
+# ---------- main window ----------
 
 class SetupWindow(Gtk.ApplicationWindow):
     def __init__(self, app):
@@ -126,6 +499,7 @@ class SetupWindow(Gtk.ApplicationWindow):
         self._sock = None
         self._username = None
         self._password = None
+        self._captcha_win = None
 
         self._stack = Gtk.Stack()
         self._stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
@@ -138,16 +512,14 @@ class SetupWindow(Gtk.ApplicationWindow):
         super().present()
         if not GTK4:
             self.show_all()
-            self._err.hide()   # show_all() overrides set_visible(False)
+            self._err.hide()
 
     # ----- login page -----
 
     def _build_login_page(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        box.set_margin_top(28)
-        box.set_margin_bottom(28)
-        box.set_margin_start(36)
-        box.set_margin_end(36)
+        box.set_margin_top(28); box.set_margin_bottom(28)
+        box.set_margin_start(36); box.set_margin_end(36)
 
         lbl = Gtk.Label()
         lbl.set_markup('<b>Sign in to Proton Drive</b>')
@@ -160,15 +532,12 @@ class SetupWindow(Gtk.ApplicationWindow):
         _add(box, self._email)
 
         self._pass_w = _password_entry()
-        if GTK4:
-            self._pass_w.connect('activate', self._on_sign_in)
-        else:
-            self._pass_w.connect('activate', self._on_sign_in)
+        self._pass_w.connect('activate', self._on_sign_in)
         _add(box, self._pass_w)
 
         self._err = Gtk.Label(label='')
         self._err.set_visible(False)
-        self._err.set_line_wrap(True)
+        self._err.set_wrap(True)
         _add(box, self._err)
 
         self._btn = Gtk.Button(label='Sign in')
@@ -182,10 +551,8 @@ class SetupWindow(Gtk.ApplicationWindow):
 
     def _build_spinner_page(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        box.set_margin_top(40)
-        box.set_margin_bottom(40)
-        box.set_margin_start(36)
-        box.set_margin_end(36)
+        box.set_margin_top(40); box.set_margin_bottom(40)
+        box.set_margin_start(36); box.set_margin_end(36)
         self._spinner = Gtk.Spinner()
         self._spinner.set_size_request(48, 48)
         _add(box, self._spinner)
@@ -208,87 +575,172 @@ class SetupWindow(Gtk.ApplicationWindow):
             self._stack.get_visible_child().show_all()
         threading.Thread(target=self._auth_thread, daemon=True).start()
 
-    # ----- captcha page -----
+    # ----- human verification dispatch -----
 
-    def _show_captcha(self, hv_token, captcha_html=''):
-        print(f'[setup] _show_captcha called, html_len={len(captcha_html)}', file=sys.stderr)
+    def _show_hv(self, hv_token, methods):
+        """Called on the GLib main thread when Auth returns HVRequired.
+
+        Always offers an email code first (using the address the user typed),
+        regardless of the methods list — the server only ever lists 'captcha'
+        for automated clients, but accepts email codes too.  The captcha image
+        is shown as a fallback button.
+        """
+        print(f'[setup] HV required, methods={methods}', file=sys.stderr)
+        self._spinner.stop()
+        self._stack.set_visible_child_name('login')
+        self._show_code_dialog(hv_token)
+
+    # ----- email code dialog -----
+
+    def _show_code_dialog(self, hv_token):
+        """Send a verification code to the user's registered Proton email address."""
+        dlg = Gtk.Window(title='Proton Drive — Verification', default_width=400,
+                         resizable=False)
+        if GTK4:
+            dlg.set_transient_for(self)
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        vbox.set_margin_top(24); vbox.set_margin_bottom(24)
+        vbox.set_margin_start(32); vbox.set_margin_end(32)
+
+        lbl = Gtk.Label()
+        lbl.set_markup('Proton requires human verification.\n'
+                       'Click <b>Send code</b> to receive a verification code\n'
+                       f'at <b>{self._username}</b>.')
+        lbl.set_wrap(True)
+        _add(vbox, lbl)
+
+        status_lbl = Gtk.Label(label='')
+        status_lbl.set_wrap(True)
+        status_lbl.set_visible(False)
+        _add(vbox, status_lbl)
+
+        code_lbl = Gtk.Label(label='Verification code:')
+        code_lbl.set_visible(False)
+        _add(vbox, code_lbl)
+        code_entry = Gtk.Entry()
+        code_entry.set_placeholder_text('Enter code')
+        code_entry.set_visible(False)
+        _add(vbox, code_entry)
+
+        send_btn = Gtk.Button(label='Send code')
+        if GTK4:
+            send_btn.add_css_class('suggested-action')
+        _add(vbox, send_btn)
+
+        verify_btn = Gtk.Button(label='Verify')
+        if GTK4:
+            verify_btn.add_css_class('suggested-action')
+        verify_btn.set_visible(False)
+        _add(vbox, verify_btn)
+
+        captcha_btn = Gtk.Button(label='Use image captcha instead')
+        _add(vbox, captcha_btn)
+
+        if GTK4:
+            dlg.set_child(vbox)
+        else:
+            dlg.add(vbox)
+            dlg.show_all()
+            status_lbl.hide(); code_lbl.hide(); code_entry.hide(); verify_btn.hide()
+
+        def on_send(*_):
+            send_btn.set_sensitive(False)
+            status_lbl.set_text('Sending code…')
+            status_lbl.set_visible(True)
+
+            def do_send():
+                resp = rpc_call(self._sock, 'SendCode', {
+                    'username': self._username,
+                    'type': 'email',
+                    'address': self._username,
+                })
+                print(f'[setup] SendCode response: {resp}', file=sys.stderr)
+                if 'error' in resp:
+                    msg = resp['error'].get('message', 'Failed to send code.')
+                    GLib.idle_add(status_lbl.set_text, msg)
+                    GLib.idle_add(send_btn.set_sensitive, True)
+                else:
+                    GLib.idle_add(status_lbl.set_text, 'Code sent — check your Proton inbox.')
+                    GLib.idle_add(code_lbl.set_visible, True)
+                    GLib.idle_add(code_entry.set_visible, True)
+                    GLib.idle_add(verify_btn.set_visible, True)
+
+            threading.Thread(target=do_send, daemon=True).start()
+
+        def on_verify(*_):
+            code = code_entry.get_text().strip()
+            if not code:
+                return
+            dlg.close()
+            GLib.idle_add(self._spinner.start)
+            GLib.idle_add(self._stack.set_visible_child_name, 'spinner')
+            threading.Thread(target=self._auth_hv_thread,
+                             args=(code, 'email'), daemon=True).start()
+
+        def on_captcha(*_):
+            dlg.close()
+            threading.Thread(target=self._captcha_prepare_thread,
+                             args=(hv_token,), daemon=True).start()
+
+        send_btn.connect('clicked', on_send)
+        verify_btn.connect('clicked', on_verify)
+        code_entry.connect('activate', on_verify)
+        captcha_btn.connect('clicked', on_captcha)
+        dlg.present()
+
+    # ----- captcha flow -----
+
+    def _show_captcha(self, captcha_token):
+        """Called on the GLib main thread when captcha is the only HV method."""
+        print('[setup] starting captcha flow', file=sys.stderr)
+        threading.Thread(target=self._captcha_prepare_thread,
+                         args=(captcha_token,), daemon=True).start()
+
+    def _captcha_prepare_thread(self, captcha_token):
+        """Background: fetch sub_token + puzzle images, then hand off to UI."""
         try:
-            self._show_captcha_inner(hv_token, captcha_html)
-        except Exception:
+            sub_token            = captcha_extract_sub_token(captcha_token)
+            init_data            = captcha_init(captcha_token)
+            bg_bytes, piece_bytes = captcha_fetch_images(init_data['token'])
+            GLib.idle_add(self._show_captcha_ui,
+                          captcha_token, sub_token, init_data, bg_bytes, piece_bytes)
+        except Exception as e:
             import traceback; traceback.print_exc()
-            self._show_err('Failed to display CAPTCHA — see terminal for details.')
+            GLib.idle_add(self._show_err, f'Could not load CAPTCHA: {e}')
 
-    def _show_captcha_inner(self, hv_token, captcha_html=''):
-        if WebKit is None:
-            self._show_err('webkitgtk not installed — cannot display CAPTCHA.\n'
-                           'Install gir1.2-webkitgtk-6.0 or gir1.2-webkit2-4.1.')
+    def _show_captcha_ui(self, captcha_token, sub_token, init_data, bg_bytes, piece_bytes):
+        """GLib main thread: open the puzzle window and wait for a drag-drop."""
+        def on_solved(x, y, trajectory):
+            self._captcha_win = None
+            threading.Thread(target=self._captcha_solve_thread,
+                             args=(captcha_token, sub_token, init_data, x, y, trajectory),
+                             daemon=True).start()
+
+        def on_error(msg):
+            self._captcha_win = None
+            self._show_err(msg)
+
+        self._captcha_win = CaptchaWindow(bg_bytes, piece_bytes, on_solved, on_error)
+        if GTK4:
+            self._captcha_win.set_transient_for(self)
+        self._captcha_win.present()
+
+    def _captcha_solve_thread(self, captcha_token, sub_token, init_data, x, y, trajectory):
+        """Background: solve PoW, validate, finalize, then call AuthWithHV."""
+        try:
+            proved_token = captcha_validate(
+                init_data['token'], init_data['contestId'], x, y, init_data, trajectory)
+            hv_token = build_hv_token(captcha_token, sub_token, proved_token)
+            print(f'[captcha] hv_token prefix: {hv_token[:16]}…', file=sys.stderr)
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            GLib.idle_add(self._show_err, f'CAPTCHA validation failed: {e}')
             return
 
-        ucm = WebKit.UserContentManager()
-        # Proton's captcha page detects window.webkit.messageHandlers.linuxWebkitWebview
-        # and sends the pm_captcha result through it natively on Linux.
-        ucm.register_script_message_handler('linuxWebkitWebview')
-        ucm.connect('script-message-received::linuxWebkitWebview', self._on_captcha_token)
-
-        wv = WebKit.WebView(user_content_manager=ucm)
-
-        # Enable inspector so we can see JS errors and network failures
-        settings = wv.get_settings()
-        settings.set_enable_developer_extras(True)
-        wv.get_inspector().show()
-        wv.set_vexpand(True)
-        wv.set_hexpand(True)
-
-        def on_load_changed(wv, event):
-            print(f'[setup] webview load event: {event}', file=sys.stderr)
-        def on_load_failed(wv, event, uri, error):
-            print(f'[setup] webview load FAILED: {uri!r} — {error}', file=sys.stderr)
-            return False
-        wv.connect('load-changed', on_load_changed)
-        wv.connect('load-failed', on_load_failed)
-
-        print(f'[setup] captcha HTML preview:\n{captcha_html[:1500]}', file=sys.stderr)
-
-        if captcha_html:
-            wv.load_html(captcha_html, 'https://mail.proton.me/')
-        else:
-            url = (f'{PROTON_API}/core/v4/captcha'
-                   f'?Token={urllib.parse.quote(hv_token)}&ForceWebMessaging=1')
-            wv.load_uri(url)
-
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        note = Gtk.Label(label='Complete the verification to continue.')
-        note.set_margin_top(8)
-        note.set_margin_bottom(4)
-        _add(box, note)
-        if GTK4:
-            box.append(wv)
-        else:
-            box.pack_start(wv, True, True, 0)
-
-        # GTK3: widgets must be shown before Stack can display them.
-        # show_all() here, before add_named/set_visible_child_name.
-        if not GTK4:
-            box.show_all()
-
-        self._stack.add_named(box, 'captcha')
-        self._stack.set_visible_child_name('captcha')
-        self.set_default_size(480, 520)
-        self.set_resizable(True)
-        print('[setup] captcha page shown', file=sys.stderr)
-
-    def _on_captcha_token(self, _mgr, js_result):
-        try:
-            val = js_result.get_js_value()          # WebKit 6
-        except AttributeError:
-            val = js_result.get_value()             # WebKit2 4.x
-        try:
-            # Page sends {type: 'pm_captcha', token: '...'} as an object
-            token = val.object_get_property('token').to_string()
-        except Exception:
-            token = val.to_string()
-        print(f'[setup] captcha token received: {token[:8]}…', file=sys.stderr)
-        threading.Thread(target=self._auth_hv_thread, args=(token,), daemon=True).start()
+        GLib.idle_add(self._spinner.start)
+        GLib.idle_add(self._stack.set_visible_child_name, 'spinner')
+        self._auth_hv_thread(hv_token, 'captcha')
 
     # ----- RPC threads -----
 
@@ -303,7 +755,6 @@ class SetupWindow(Gtk.ApplicationWindow):
                 return
 
             self._sock = tempfile.mktemp(suffix='.sock', prefix='proton-setup-', dir='/tmp')
-            print(f'[setup] socket: {self._sock}', file=sys.stderr)
             self._proc = subprocess.Popen(
                 [helper, '--socket', self._sock],
                 stdout=subprocess.DEVNULL, stderr=sys.stderr,
@@ -325,11 +776,12 @@ class SetupWindow(Gtk.ApplicationWindow):
             import traceback; traceback.print_exc()
             GLib.idle_add(self._show_err, str(e))
 
-    def _auth_hv_thread(self, hv_token):
+    def _auth_hv_thread(self, hv_token, hv_type='captcha'):
         try:
             resp = rpc_call(self._sock, 'AuthWithHV',
                             {'username': self._username, 'password': self._password,
-                             'hv_token': hv_token})
+                             'hv_token': hv_token, 'type': hv_type})
+            print(f'[setup] AuthWithHV response: {resp}', file=sys.stderr)
             self._handle_auth_resp(resp)
         except Exception as e:
             GLib.idle_add(self._show_err, str(e))
@@ -338,16 +790,10 @@ class SetupWindow(Gtk.ApplicationWindow):
         if 'error' in resp:
             code = resp['error'].get('code')
             if code == -32004:
-                hv_token = (resp['error'].get('details') or {}).get('token', '')
-                # Fetch captcha HTML through the helper — it already holds the
-                # API connection with proper headers so the response is complete.
-                try:
-                    cr = rpc_call(self._sock, 'GetCaptcha', {'hv_token': hv_token})
-                    captcha_html = cr.get('result', {}).get('html', '')
-                    print(f'[setup] captcha HTML length: {len(captcha_html)}', file=sys.stderr)
-                except Exception:
-                    captcha_html = ''
-                GLib.idle_add(self._show_captcha, hv_token, captcha_html)
+                details = resp['error'].get('details') or {}
+                hv_token = details.get('token', '')
+                methods  = details.get('methods') or ['captcha']
+                GLib.idle_add(self._show_hv, hv_token, methods)
             else:
                 msg = resp['error'].get('message', 'Authentication failed.')
                 GLib.idle_add(self._show_err, msg)
@@ -362,8 +808,6 @@ class SetupWindow(Gtk.ApplicationWindow):
             secret_store(f'Proton Drive session UID ({u})', u, 'uid', result['uid'])
             secret_store(f'Proton Drive refresh token ({u})', u,
                          'refresh_token', result['refresh_token'])
-            # salted_passphrase is already base64 from JSON; stored as-is so
-            # do_mount can g_base64_decode() it directly.
             secret_store(f'Proton Drive key passphrase ({u})', u,
                          'salted_passphrase', result['salted_passphrase'])
         except Exception as e:
@@ -389,6 +833,9 @@ class SetupWindow(Gtk.ApplicationWindow):
         self._stack.set_visible_child_name('login')
 
     def _cleanup(self):
+        if self._captcha_win:
+            self._captcha_win.close()
+            self._captcha_win = None
         if self._proc:
             self._proc.terminate()
             self._proc = None
