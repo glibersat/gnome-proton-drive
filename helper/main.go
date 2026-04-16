@@ -29,7 +29,7 @@ func main() {
 	}
 	defer ln.Close()
 
-	mgr := proton.New()
+	mgr := proton.New(proton.WithAppVersion("Other@1.0.0"))
 	srv := rpc.NewServer()
 
 	var session *drive.Session
