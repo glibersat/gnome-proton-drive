@@ -2,9 +2,9 @@
 # proton-drive-setup — one-time credential setup for gnome-proton.
 #
 # Prompts for Proton credentials via zenity dialogs, performs a full SRP
-# login through proton-drive-helper, then stores the resulting session
-# tokens (uid, refresh_token, salted_passphrase) in the GNOME keyring via
-# libsecret. The password is never written to disk.
+# login through proton-drive-helper, handles CAPTCHA challenges, then
+# stores the resulting session tokens in the GNOME keyring. The password
+# is never written to disk.
 #
 # Requirements: zenity, jq, python3, secret-tool, proton-drive-helper
 
@@ -21,8 +21,7 @@ find_helper() {
   for c in "${candidates[@]}"; do
     [[ -x "$c" ]] && { echo "$c"; return; }
   done
-  command -v proton-drive-helper 2>/dev/null && return
-  echo ""
+  command -v proton-drive-helper 2>/dev/null || echo ""
 }
 
 HELPER=$(find_helper)
@@ -71,7 +70,6 @@ trap cleanup EXIT
 "$HELPER" --socket "$SOCKET" &
 HELPER_PID=$!
 
-# Poll until socket appears (up to 5 s)
 for _ in $(seq 1 50); do
   [[ -S "$SOCKET" ]] && break
   sleep 0.1
@@ -83,87 +81,191 @@ done
   exit 1
 }
 
-# ---------- perform Auth RPC via python3 ----------
-# Python3 is used to speak line-delimited JSON over the Unix socket.
-# Credentials are passed via environment variables, never via argv.
-
-RESPONSE=$(USERNAME="$USERNAME" PASSWORD="$PASSWORD" SOCKET="$SOCKET" \
-  python3 - <<'PYEOF'
-import socket, json, os, sys
+# ---------- Python helpers ----------
+# rpc_call SOCKET METHOD PARAMS_JSON → response JSON
+rpc_call() {
+  SOCKET="$1" METHOD="$2" PARAMS="$3" python3 - <<'PYEOF'
+import socket, json, os
 
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 s.connect(os.environ["SOCKET"])
-
-req = json.dumps({
-    "id": 1,
-    "method": "Auth",
-    "params": {
-        "username": os.environ["USERNAME"],
-        "password": os.environ["PASSWORD"],
-    }
-}) + "\n"
-
+req = json.dumps({"id": 1, "method": os.environ["METHOD"],
+                  "params": json.loads(os.environ["PARAMS"])}) + "\n"
 s.sendall(req.encode())
-
 data = b""
 while not data.endswith(b"\n"):
-    chunk = s.recv(4096)
+    chunk = s.recv(65536)
     if not chunk:
         break
     data += chunk
+s.close()
+print(data.decode().strip())
+PYEOF
+}
 
+# ---------- Auth (with CAPTCHA retry) ----------
+
+AUTH_RESPONSE=$(USERNAME="$USERNAME" PASSWORD="$PASSWORD" SOCKET="$SOCKET" \
+  python3 - <<'PYEOF'
+import socket, json, os
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(os.environ["SOCKET"])
+req = json.dumps({"id":1,"method":"Auth",
+                  "params":{"username":os.environ["USERNAME"],
+                             "password":os.environ["PASSWORD"]}}) + "\n"
+s.sendall(req.encode())
+data = b""
+while not data.endswith(b"\n"):
+    chunk = s.recv(65536)
+    if not chunk: break
+    data += chunk
 s.close()
 print(data.decode().strip())
 PYEOF
 )
 
-# Check for RPC-level error
-if echo "$RESPONSE" | jq -e '.error' >/dev/null 2>&1; then
-  MSG=$(echo "$RESPONSE" | jq -r '.error.message')
+ERROR_CODE=$(echo "$AUTH_RESPONSE" | jq -r '.error.code // empty')
+
+# Handle CAPTCHA challenge (code -32004)
+if [[ "$ERROR_CODE" == "-32004" ]]; then
+  HV_TOKEN=$(echo "$AUTH_RESPONSE" | jq -r '.error.details.token')
+
+  # Fetch captcha HTML through the helper (it already has the API connection)
+  CAPTCHA_RESP=$(rpc_call "$SOCKET" "GetCaptcha" "{\"hv_token\":\"$HV_TOKEN\"}")
+  CAPTCHA_HTML=$(echo "$CAPTCHA_RESP" | jq -r '.result.html')
+
+  if [[ -z "$CAPTCHA_HTML" || "$CAPTCHA_HTML" == "null" ]]; then
+    zenity --error --title="Proton Drive Setup" \
+      --text="Failed to load CAPTCHA from Proton." 2>/dev/null
+    exit 1
+  fi
+
+  # Run a local HTTP server that:
+  #  1. Serves the captcha HTML with an injected postMessage→callback listener
+  #  2. Waits for the hCaptcha response token via /callback?token=...
+  #  3. Prints the token and exits
+  HV_RESPONSE=$(CAPTCHA_HTML="$CAPTCHA_HTML" python3 - <<'PYEOF'
+import http.server, urllib.parse, threading, webbrowser, sys, json, os
+
+INJECT = """
+<script>
+window.addEventListener('message', function(e) {
+  if (e.data && e.data.type === 'pm_captcha') {
+    var img = new Image();
+    img.src = '/callback?token=' + encodeURIComponent(e.data.token);
+  }
+});
+</script>
+"""
+
+html = os.environ["CAPTCHA_HTML"]
+# Inject our listener just before </body>
+if '</body>' in html:
+    html = html.replace('</body>', INJECT + '</body>')
+else:
+    html += INJECT
+
+result = {}
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.startswith('/callback'):
+            params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            result['token'] = params.get('token', [''])[0]
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b'<html><body><script>window.close()</script>'
+                             b'<p>Verification complete. You can close this window.</p>'
+                             b'</body></html>')
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
+        else:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(html.encode())))
+            self.end_headers()
+            self.wfile.write(html.encode())
+    def log_message(self, *args):
+        pass
+
+server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+port = server.server_address[1]
+webbrowser.open(f'http://127.0.0.1:{port}/')
+server.serve_forever()
+
+if result.get('token'):
+    print(result['token'])
+else:
+    sys.exit(1)
+PYEOF
+  )
+
+  if [[ -z "$HV_RESPONSE" ]]; then
+    zenity --error --title="Proton Drive Setup" \
+      --text="CAPTCHA was not completed." 2>/dev/null
+    exit 1
+  fi
+
+  # Retry Auth with the hCaptcha response token
+  AUTH_RESPONSE=$(USERNAME="$USERNAME" PASSWORD="$PASSWORD" HV_TOKEN="$HV_RESPONSE" SOCKET="$SOCKET" \
+    python3 - <<'PYEOF'
+import socket, json, os
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(os.environ["SOCKET"])
+req = json.dumps({"id":1,"method":"AuthWithHV",
+                  "params":{"username":os.environ["USERNAME"],
+                             "password":os.environ["PASSWORD"],
+                             "hv_token":os.environ["HV_TOKEN"]}}) + "\n"
+s.sendall(req.encode())
+data = b""
+while not data.endswith(b"\n"):
+    chunk = s.recv(65536)
+    if not chunk: break
+    data += chunk
+s.close()
+print(data.decode().strip())
+PYEOF
+  )
+  ERROR_CODE=$(echo "$AUTH_RESPONSE" | jq -r '.error.code // empty')
+fi
+
+# Any remaining error is fatal
+if [[ -n "$ERROR_CODE" ]]; then
+  MSG=$(echo "$AUTH_RESPONSE" | jq -r '.error.message')
   zenity --error \
     --title="Proton Drive — Authentication failed" \
-    --text="$MSG\n\nCheck your email and password and try again." \
+    --text="$MSG\n\nCheck your credentials and try again." \
     2>/dev/null || echo "Authentication failed: $MSG" >&2
   exit 1
 fi
 
-# ---------- extract tokens ----------
+# ---------- extract and store tokens ----------
 
-UID_VAL=$(echo        "$RESPONSE" | jq -r '.result.uid')
-REFRESH_TOKEN=$(echo  "$RESPONSE" | jq -r '.result.refresh_token')
-SALTED_PASS=$(echo    "$RESPONSE" | jq -r '.result.salted_passphrase')
+UID_VAL=$(echo       "$AUTH_RESPONSE" | jq -r '.result.uid')
+REFRESH_TOKEN=$(echo "$AUTH_RESPONSE" | jq -r '.result.refresh_token')
+SALTED_PASS=$(echo   "$AUTH_RESPONSE" | jq -r '.result.salted_passphrase')
 
 if [[ -z "$UID_VAL" || "$UID_VAL" == "null" ||
       -z "$REFRESH_TOKEN" || "$REFRESH_TOKEN" == "null" ||
       -z "$SALTED_PASS" || "$SALTED_PASS" == "null" ]]; then
   zenity --error --title="Proton Drive Setup" \
-    --text="Unexpected response from helper — missing token fields." 2>/dev/null
+    --text="Unexpected response — missing token fields." 2>/dev/null
   exit 1
 fi
 
-# ---------- store in libsecret ----------
-# Three separate entries under the same schema+username, differentiated by
-# the 'field' attribute so secret-tool can look them up individually.
-
 printf '%s' "$UID_VAL" | secret-tool store \
   --label="Proton Drive session UID ($USERNAME)" \
-  schema   org.gnome.proton.drive \
-  username "$USERNAME" \
-  field    uid
+  schema org.gnome.proton.drive username "$USERNAME" field uid
 
 printf '%s' "$REFRESH_TOKEN" | secret-tool store \
   --label="Proton Drive refresh token ($USERNAME)" \
-  schema   org.gnome.proton.drive \
-  username "$USERNAME" \
-  field    refresh_token
+  schema org.gnome.proton.drive username "$USERNAME" field refresh_token
 
 # salted_passphrase is already base64 from the JSON response; store as-is
 # because do_mount calls g_base64_decode() on the value it reads back.
 printf '%s' "$SALTED_PASS" | secret-tool store \
   --label="Proton Drive key passphrase ($USERNAME)" \
-  schema   org.gnome.proton.drive \
-  username "$USERNAME" \
-  field    salted_passphrase
+  schema org.gnome.proton.drive username "$USERNAME" field salted_passphrase
 
 # ---------- done ----------
 

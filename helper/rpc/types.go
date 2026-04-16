@@ -15,8 +15,9 @@ type Response struct {
 }
 
 type RPCError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
+	Code    int             `json:"code"`
+	Message string          `json:"message"`
+	Details json.RawMessage `json:"details,omitempty"`
 }
 
 func (e *RPCError) Error() string { return e.Message }
@@ -27,7 +28,14 @@ const (
 	ErrNotFound   = -32001
 	ErrAuthFailed = -32002
 	ErrNotAuthed  = -32003
+	ErrHVRequired = -32004 // human verification (CAPTCHA) needed
 )
+
+// HVDetails is embedded in RPCError.Details when Code == ErrHVRequired.
+type HVDetails struct {
+	Token   string   `json:"token"`
+	Methods []string `json:"methods"`
+}
 
 // Wire types — one struct per method.
 
@@ -53,6 +61,23 @@ type ResumeParams struct {
 	UID              string `json:"uid"`
 	RefreshToken     string `json:"refresh_token"`
 	SaltedPassphrase []byte `json:"salted_passphrase"`
+}
+
+// AuthWithHVParams retries Auth after the user completes a CAPTCHA challenge.
+// HVToken is the hCaptcha response token captured from the browser.
+type AuthWithHVParams struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+	HVToken  string `json:"hv_token"`
+}
+
+// GetCaptchaParams fetches the captcha HTML for a given HV token.
+type GetCaptchaParams struct {
+	HVToken string `json:"hv_token"`
+}
+
+type GetCaptchaResult struct {
+	HTML string `json:"html"`
 }
 
 type ListDirParams struct{ Path string `json:"path"` }

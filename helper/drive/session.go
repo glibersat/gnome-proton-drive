@@ -2,6 +2,7 @@ package drive
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"path"
@@ -23,6 +24,16 @@ type Session struct {
 	nodeKRs map[string]*crypto.KeyRing // linkID → decrypted node keyring (cache)
 }
 
+// HVRequiredError is returned by NewSession when Proton requires a CAPTCHA.
+// The caller should fetch the captcha HTML (via Manager.GetCaptcha), complete
+// it in a browser, then retry with NewSessionWithHV.
+type HVRequiredError struct {
+	Token   string
+	Methods []string
+}
+
+func (e *HVRequiredError) Error() string { return "human verification required" }
+
 // SessionCredentials holds the values that should be stored in libsecret
 // so that future mounts can resume without re-doing SRP.
 type SessionCredentials struct {
@@ -31,10 +42,58 @@ type SessionCredentials struct {
 	SaltedPassphrase []byte // KDF output — unlocks address keys but not SRP login
 }
 
-// NewSession authenticates via SRP and returns the session plus the
-// credentials that should be persisted in the keyring.
+// NewSession authenticates via SRP. Returns HVRequiredError if Proton requires
+// a CAPTCHA — the caller should complete it and retry via NewSessionWithHV.
 func NewSession(ctx context.Context, mgr *proton.Manager, username, password string) (*Session, SessionCredentials, error) {
 	c, auth, err := mgr.NewClientWithLogin(ctx, username, []byte(password))
+	if err != nil {
+		var apiErr proton.APIError
+		if errors.As(err, &apiErr) && apiErr.IsHVError() {
+			hv, hvErr := apiErr.GetHVDetails()
+			if hvErr == nil {
+				return nil, SessionCredentials{}, &HVRequiredError{
+					Token:   hv.Token,
+					Methods: hv.Methods,
+				}
+			}
+		}
+		return nil, SessionCredentials{}, err
+	}
+
+	addrKR, saltedPass, err := unlockPrimaryAddress(ctx, c, []byte(password))
+	if err != nil {
+		_ = c.AuthDelete(ctx)
+		return nil, SessionCredentials{}, err
+	}
+
+	shareID, rootID, err := findMainShare(ctx, c)
+	if err != nil {
+		_ = c.AuthDelete(ctx)
+		return nil, SessionCredentials{}, err
+	}
+
+	creds := SessionCredentials{
+		UID:              auth.UID,
+		RefreshToken:     auth.RefreshToken,
+		SaltedPassphrase: saltedPass,
+	}
+	return &Session{
+		client:  c,
+		shareID: shareID,
+		rootID:  rootID,
+		addrKR:  addrKR,
+		nodeKRs: make(map[string]*crypto.KeyRing),
+	}, creds, nil
+}
+
+// NewSessionWithHV retries SRP login after the user completes a CAPTCHA.
+// hvToken is the hCaptcha response token captured from the browser page.
+func NewSessionWithHV(ctx context.Context, mgr *proton.Manager, username, password, hvToken string) (*Session, SessionCredentials, error) {
+	hv := &proton.APIHVDetails{
+		Methods: []string{"captcha"},
+		Token:   hvToken,
+	}
+	c, auth, err := mgr.NewClientWithLoginWithHVToken(ctx, username, []byte(password), hv)
 	if err != nil {
 		return nil, SessionCredentials{}, err
 	}

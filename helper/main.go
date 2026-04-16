@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"log"
 	"net"
@@ -29,7 +30,7 @@ func main() {
 	}
 	defer ln.Close()
 
-	mgr := proton.New(proton.WithAppVersion("Other-Drive@1.0.0"))
+	mgr := proton.New(proton.WithAppVersion("web-drive@5.0.0"))
 	srv := rpc.NewServer()
 
 	var session *drive.Session
@@ -41,14 +42,60 @@ func main() {
 		return session, nil
 	}
 
-	// Auth performs a full SRP login. Returns credentials that the caller
-	// should store in libsecret; the password must not be stored.
+	// Auth performs a full SRP login. On success returns credentials to store
+	// in libsecret. On CAPTCHA challenge returns ErrHVRequired with HVDetails
+	// so the caller can open a browser and retry via AuthWithHV.
 	srv.Register("Auth", func(ctx context.Context, raw json.RawMessage) (any, error) {
 		var p rpc.AuthParams
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, &rpc.RPCError{Code: rpc.ErrInvalidArg, Message: err.Error()}
 		}
 		s, creds, err := drive.NewSession(ctx, mgr, p.Username, p.Password)
+		if err != nil {
+			var hvErr *drive.HVRequiredError
+			if errors.As(err, &hvErr) {
+				details, _ := json.Marshal(rpc.HVDetails{
+					Token:   hvErr.Token,
+					Methods: hvErr.Methods,
+				})
+				return nil, &rpc.RPCError{
+					Code:    rpc.ErrHVRequired,
+					Message: "human verification required",
+					Details: details,
+				}
+			}
+			return nil, &rpc.RPCError{Code: rpc.ErrAuthFailed, Message: err.Error()}
+		}
+		session = s
+		return rpc.AuthResult{
+			UID:              creds.UID,
+			RefreshToken:     creds.RefreshToken,
+			SaltedPassphrase: creds.SaltedPassphrase,
+		}, nil
+	})
+
+	// GetCaptcha fetches the hCaptcha HTML page for the given HV token.
+	// The setup script serves this locally, intercepts the postMessage result,
+	// and passes the response token back via AuthWithHV.
+	srv.Register("GetCaptcha", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		var p rpc.GetCaptchaParams
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, &rpc.RPCError{Code: rpc.ErrInvalidArg, Message: err.Error()}
+		}
+		html, err := mgr.GetCaptcha(ctx, p.HVToken)
+		if err != nil {
+			return nil, &rpc.RPCError{Code: rpc.ErrInternal, Message: err.Error()}
+		}
+		return rpc.GetCaptchaResult{HTML: string(html)}, nil
+	})
+
+	// AuthWithHV retries SRP login with the hCaptcha response token.
+	srv.Register("AuthWithHV", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		var p rpc.AuthWithHVParams
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, &rpc.RPCError{Code: rpc.ErrInvalidArg, Message: err.Error()}
+		}
+		s, creds, err := drive.NewSessionWithHV(ctx, mgr, p.Username, p.Password, p.HVToken)
 		if err != nil {
 			return nil, &rpc.RPCError{Code: rpc.ErrAuthFailed, Message: err.Error()}
 		}
