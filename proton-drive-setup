@@ -130,28 +130,15 @@ ERROR_CODE=$(echo "$AUTH_RESPONSE" | jq -r '.error.code // empty')
 if [[ "$ERROR_CODE" == "-32004" ]]; then
   HV_TOKEN=$(echo "$AUTH_RESPONSE" | jq -r '.error.details.token')
 
-  # Fetch captcha HTML through the helper (it already has the API connection)
-  CAPTCHA_RESP=$(rpc_call "$SOCKET" "GetCaptcha" "{\"hv_token\":\"$HV_TOKEN\"}")
-  CAPTCHA_HTML=$(echo "$CAPTCHA_RESP" | jq -r '.result.html')
-
-  if [[ -z "$CAPTCHA_HTML" || "$CAPTCHA_HTML" == "null" ]]; then
-    zenity --error --title="Proton Drive Setup" \
-      --text="Failed to load CAPTCHA from Proton." 2>/dev/null
-    exit 1
-  fi
-
-  # Run a local HTTP server that:
-  #  1. Serves the captcha HTML with a <base> pointing to Proton so asset
-  #     URLs (e.g. /captcha/v1/assets/…) resolve to account.proton.me
-  #     instead of looping back to localhost.
-  #  2. Injects a postMessage listener that uses a full absolute callback
-  #     URL (http://127.0.0.1:<port>/callback) so the base tag doesn't
-  #     redirect it to Proton's domain.
-  #  3. Prints the hCaptcha response token and exits.
-  HV_RESPONSE=$(CAPTCHA_HTML="$CAPTCHA_HTML" python3 - <<'PYEOF'
+  # Serve a local wrapper page that iframes Proton's captcha endpoint
+  # directly. This way the captcha and its sub-iframes are same-origin to
+  # mail.proton.me, so X-Frame-Options SAMEORIGIN is satisfied. The
+  # postMessage from the captcha iframe crosses origins to our wrapper,
+  # which is allowed because postMessage is explicitly cross-origin.
+  HV_RESPONSE=$(HV_TOKEN="$HV_TOKEN" python3 - <<'PYEOF'
 import http.server, urllib.parse, threading, webbrowser, sys, os
 
-raw_html = os.environ["CAPTCHA_HTML"]
+hv_token = os.environ["HV_TOKEN"]
 result = {}
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -179,10 +166,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
 server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
 port = server.server_address[1]
 
-# <base href> makes root-relative asset URLs resolve to account.proton.me.
-# The callback uses a full absolute URL so it is unaffected by the base tag.
-BASE_TAG = '<base href="https://account.proton.me/">'
-INJECT = f"""
+captcha_url = (
+    'https://mail.proton.me/api/core/v4/captcha'
+    f'?Token={urllib.parse.quote(hv_token)}&ForceWebMessaging=1'
+)
+
+page_html = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Proton Drive — Verification</title>
+<style>
+  body {{ margin: 0; display: flex; flex-direction: column;
+         align-items: center; justify-content: center;
+         min-height: 100vh; background: #1c1c1c; color: #fff;
+         font-family: sans-serif; }}
+  p {{ margin-bottom: 12px; }}
+  iframe {{ border: none; width: 400px; height: 300px; }}
+</style>
+</head>
+<body>
+<p>Complete the verification to continue signing in to Proton Drive.</p>
+<iframe src="{captcha_url}"></iframe>
 <script>
 window.addEventListener('message', function(e) {{
   if (e.data && e.data.type === 'pm_captcha') {{
@@ -191,24 +194,8 @@ window.addEventListener('message', function(e) {{
   }}
 }});
 </script>
-"""
-
-html = raw_html
-if '<head>' in html:
-    html = html.replace('<head>', '<head>' + BASE_TAG, 1)
-elif '<head' in html:
-    # head tag with attributes
-    import re
-    html = re.sub(r'(<head[^>]*>)', r'\1' + BASE_TAG, html, count=1)
-else:
-    html = BASE_TAG + html
-
-if '</body>' in html:
-    html = html.replace('</body>', INJECT + '</body>', 1)
-else:
-    html += INJECT
-
-page_html = html
+</body>
+</html>"""
 
 webbrowser.open(f'http://127.0.0.1:{port}/')
 server.serve_forever()
