@@ -1,0 +1,5 @@
+[Mount]
+Type=proton
+Exec=@libexecdir@/gvfsd-proton
+AutoMount=false
+Scheme=proton
