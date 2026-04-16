@@ -141,30 +141,17 @@ if [[ "$ERROR_CODE" == "-32004" ]]; then
   fi
 
   # Run a local HTTP server that:
-  #  1. Serves the captcha HTML with an injected postMessage→callback listener
-  #  2. Waits for the hCaptcha response token via /callback?token=...
-  #  3. Prints the token and exits
+  #  1. Serves the captcha HTML with a <base> pointing to Proton so asset
+  #     URLs (e.g. /captcha/v1/assets/…) resolve to account.proton.me
+  #     instead of looping back to localhost.
+  #  2. Injects a postMessage listener that uses a full absolute callback
+  #     URL (http://127.0.0.1:<port>/callback) so the base tag doesn't
+  #     redirect it to Proton's domain.
+  #  3. Prints the hCaptcha response token and exits.
   HV_RESPONSE=$(CAPTCHA_HTML="$CAPTCHA_HTML" python3 - <<'PYEOF'
-import http.server, urllib.parse, threading, webbrowser, sys, json, os
+import http.server, urllib.parse, threading, webbrowser, sys, os
 
-INJECT = """
-<script>
-window.addEventListener('message', function(e) {
-  if (e.data && e.data.type === 'pm_captcha') {
-    var img = new Image();
-    img.src = '/callback?token=' + encodeURIComponent(e.data.token);
-  }
-});
-</script>
-"""
-
-html = os.environ["CAPTCHA_HTML"]
-# Inject our listener just before </body>
-if '</body>' in html:
-    html = html.replace('</body>', INJECT + '</body>')
-else:
-    html += INJECT
-
+raw_html = os.environ["CAPTCHA_HTML"]
 result = {}
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -182,14 +169,47 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
-            self.send_header('Content-Length', str(len(html.encode())))
+            body = page_html.encode()
+            self.send_header('Content-Length', str(len(body)))
             self.end_headers()
-            self.wfile.write(html.encode())
+            self.wfile.write(body)
     def log_message(self, *args):
         pass
 
 server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
 port = server.server_address[1]
+
+# <base href> makes root-relative asset URLs resolve to account.proton.me.
+# The callback uses a full absolute URL so it is unaffected by the base tag.
+BASE_TAG = '<base href="https://account.proton.me/">'
+INJECT = f"""
+<script>
+window.addEventListener('message', function(e) {{
+  if (e.data && e.data.type === 'pm_captcha') {{
+    var img = new Image();
+    img.src = 'http://127.0.0.1:{port}/callback?token=' + encodeURIComponent(e.data.token);
+  }}
+}});
+</script>
+"""
+
+html = raw_html
+if '<head>' in html:
+    html = html.replace('<head>', '<head>' + BASE_TAG, 1)
+elif '<head' in html:
+    # head tag with attributes
+    import re
+    html = re.sub(r'(<head[^>]*>)', r'\1' + BASE_TAG, html, count=1)
+else:
+    html = BASE_TAG + html
+
+if '</body>' in html:
+    html = html.replace('</body>', INJECT + '</body>', 1)
+else:
+    html += INJECT
+
+page_html = html
+
 webbrowser.open(f'http://127.0.0.1:{port}/')
 server.serve_forever()
 
