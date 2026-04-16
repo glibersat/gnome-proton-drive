@@ -36,6 +36,7 @@ gvfsd_proton = executable(
     '-DBACKEND_TYPES="proton", G_VFS_TYPE_BACKEND_PROTON,',
     '-DMAX_JOB_THREADS=10',
     '-DBACKEND_USES_GVFS',
+    '-DPROTON_LIBEXECDIR="' + get_option('prefix') / get_option('libexecdir') + '"',
   ],
   include_directories: [backend_inc, gvfs_headers_inc],
   dependencies: [glib_dep, gio_dep, gio_unix_dep, json_glib_dep,
