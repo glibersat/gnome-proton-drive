@@ -1,282 +1,295 @@
-#!/usr/bin/env bash
-# proton-drive-setup — one-time credential setup for gnome-proton.
-#
-# Prompts for Proton credentials via zenity dialogs, performs a full SRP
-# login through proton-drive-helper, handles CAPTCHA challenges, then
-# stores the resulting session tokens in the GNOME keyring. The password
-# is never written to disk.
-#
-# Requirements: zenity, jq, python3, secret-tool, proton-drive-helper
+#!/usr/bin/env python3
+"""
+proton-drive-setup — Proton Drive credential wizard (A2 milestone).
 
-set -euo pipefail
+GTK4 dialog that authenticates via proton-drive-helper (SRP), handles
+CAPTCHA challenges with a native WebKitWebView, then stores the session
+tokens in the GNOME keyring.  The password is never written to disk.
 
-# ---------- locate helper binary ----------
+Requirements: python3-gi gir1.2-gtk-4.0
+              gir1.2-webkitgtk-6.0  (or gir1.2-webkit2-4.1)
+              proton-drive-helper secret-tool
+"""
 
-find_helper() {
-  local candidates=(
-    "$(dirname "$(realpath "$0")")/helper/proton-drive-helper"
-    /usr/local/libexec/proton-drive-helper
-    /usr/libexec/proton-drive-helper
-  )
-  for c in "${candidates[@]}"; do
-    [[ -x "$c" ]] && { echo "$c"; return; }
-  done
-  command -v proton-drive-helper 2>/dev/null || echo ""
-}
+import gi
+gi.require_version('Gtk', '4.0')
 
-HELPER=$(find_helper)
-if [[ -z "$HELPER" ]]; then
-  zenity --error \
-    --title="Proton Drive Setup" \
-    --text="proton-drive-helper not found.\n\nBuild it first:\n  cd helper && go build -o proton-drive-helper ." \
-    2>/dev/null || echo "ERROR: proton-drive-helper not found." >&2
-  exit 1
-fi
-
-# ---------- credential prompt ----------
-
-USERNAME=$(zenity \
-  --entry \
-  --title="Proton Drive — Sign in" \
-  --text="Proton account email:" \
-  --entry-text="" \
-  2>/dev/null) || { echo "Cancelled."; exit 0; }
-
-[[ -z "$USERNAME" ]] && {
-  zenity --error --title="Proton Drive Setup" --text="Email address is required." 2>/dev/null
-  exit 1
-}
-
-PASSWORD=$(zenity \
-  --password \
-  --title="Proton Drive — Sign in" \
-  2>/dev/null) || { echo "Cancelled."; exit 0; }
-
-[[ -z "$PASSWORD" ]] && {
-  zenity --error --title="Proton Drive Setup" --text="Password is required." 2>/dev/null
-  exit 1
-}
-
-# ---------- start helper on a temporary socket ----------
-
-SOCKET=$(mktemp -u /tmp/proton-setup-XXXXXX.sock)
-
-cleanup() {
-  [[ -n "${HELPER_PID:-}" ]] && kill "$HELPER_PID" 2>/dev/null || true
-  rm -f "$SOCKET"
-}
-trap cleanup EXIT
-
-"$HELPER" --socket "$SOCKET" &
-HELPER_PID=$!
-
-for _ in $(seq 1 50); do
-  [[ -S "$SOCKET" ]] && break
-  sleep 0.1
-done
-
-[[ -S "$SOCKET" ]] || {
-  zenity --error --title="Proton Drive Setup" \
-    --text="proton-drive-helper failed to start (socket never appeared)." 2>/dev/null
-  exit 1
-}
-
-# ---------- Python helpers ----------
-# rpc_call SOCKET METHOD PARAMS_JSON → response JSON
-rpc_call() {
-  SOCKET="$1" METHOD="$2" PARAMS="$3" python3 - <<'PYEOF'
-import socket, json, os
-
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.connect(os.environ["SOCKET"])
-req = json.dumps({"id": 1, "method": os.environ["METHOD"],
-                  "params": json.loads(os.environ["PARAMS"])}) + "\n"
-s.sendall(req.encode())
-data = b""
-while not data.endswith(b"\n"):
-    chunk = s.recv(65536)
-    if not chunk:
+for _ns, _ver in [('WebKit', '6.0'), ('WebKit2', '4.1')]:
+    try:
+        gi.require_version(_ns, _ver)
+        exec(f'from gi.repository import {_ns} as WebKit')
         break
-    data += chunk
-s.close()
-print(data.decode().strip())
-PYEOF
-}
+    except (ValueError, ImportError):
+        WebKit = None
 
-# ---------- Auth (with CAPTCHA retry) ----------
+from gi.repository import Gtk, GLib
+import json, os, shutil, socket as _socket, subprocess, sys, tempfile, threading, time, urllib.parse
 
-AUTH_RESPONSE=$(USERNAME="$USERNAME" PASSWORD="$PASSWORD" SOCKET="$SOCKET" \
-  python3 - <<'PYEOF'
-import socket, json, os
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.connect(os.environ["SOCKET"])
-req = json.dumps({"id":1,"method":"Auth",
-                  "params":{"username":os.environ["USERNAME"],
-                             "password":os.environ["PASSWORD"]}}) + "\n"
-s.sendall(req.encode())
-data = b""
-while not data.endswith(b"\n"):
-    chunk = s.recv(65536)
-    if not chunk: break
-    data += chunk
-s.close()
-print(data.decode().strip())
-PYEOF
-)
+PROTON_API = 'https://mail.proton.me/api'
 
-ERROR_CODE=$(echo "$AUTH_RESPONSE" | jq -r '.error.code // empty')
+# ---------- helpers ----------
 
-# Handle CAPTCHA challenge (code -32004)
-if [[ "$ERROR_CODE" == "-32004" ]]; then
-  HV_TOKEN=$(echo "$AUTH_RESPONSE" | jq -r '.error.details.token')
+def find_helper():
+    here = os.path.dirname(os.path.realpath(__file__))
+    for p in [
+        os.path.join(here, 'helper', 'proton-drive-helper'),
+        '/usr/local/libexec/proton-drive-helper',
+        '/usr/libexec/proton-drive-helper',
+    ]:
+        if os.access(p, os.X_OK):
+            return p
+    return shutil.which('proton-drive-helper')
 
-  # Serve a local wrapper page that iframes Proton's captcha endpoint
-  # directly. This way the captcha and its sub-iframes are same-origin to
-  # mail.proton.me, so X-Frame-Options SAMEORIGIN is satisfied. The
-  # postMessage from the captcha iframe crosses origins to our wrapper,
-  # which is allowed because postMessage is explicitly cross-origin.
-  HV_RESPONSE=$(HV_TOKEN="$HV_TOKEN" python3 - <<'PYEOF'
-import http.server, urllib.parse, threading, webbrowser, sys, os
 
-hv_token = os.environ["HV_TOKEN"]
-result = {}
+def rpc_call(sock_path, method, params):
+    s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    s.connect(sock_path)
+    s.sendall((json.dumps({'id': 1, 'method': method, 'params': params}) + '\n').encode())
+    data = b''
+    while not data.endswith(b'\n'):
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        data += chunk
+    s.close()
+    return json.loads(data)
 
-class Handler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path.startswith('/callback'):
-            params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-            result['token'] = params.get('token', [''])[0]
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/html')
-            self.end_headers()
-            self.wfile.write(b'<html><body><script>window.close()</script>'
-                             b'<p>Verification complete. You can close this window.</p>'
-                             b'</body></html>')
-            threading.Thread(target=self.server.shutdown, daemon=True).start()
+
+def secret_store(label, username, field, value):
+    subprocess.run(
+        ['secret-tool', 'store', '--label', label,
+         'schema', 'org.gnome.proton.drive',
+         'username', username, 'field', field],
+        input=value.encode(), check=True,
+    )
+
+
+# ---------- window ----------
+
+class SetupWindow(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title='Proton Drive — Sign in',
+                         default_width=420, default_height=260,
+                         resizable=False)
+        self._proc = None
+        self._sock = None
+        self._username = None
+        self._password = None
+
+        self._stack = Gtk.Stack()
+        self._stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self._stack.set_transition_duration(150)
+        self.set_child(self._stack)
+        self._build_login_page()
+
+    # ----- login page -----
+
+    def _build_login_page(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
+                      margin_top=28, margin_bottom=28,
+                      margin_start=36, margin_end=36)
+
+        lbl = Gtk.Label()
+        lbl.set_markup('<b>Sign in to Proton Drive</b>')
+        lbl.set_margin_bottom(4)
+        box.append(lbl)
+
+        self._email = Gtk.Entry()
+        self._email.set_placeholder_text('Email address')
+        self._email.connect('activate', lambda _: self._pass.grab_focus())
+        box.append(self._email)
+
+        self._pass = Gtk.PasswordEntry()
+        self._pass.set_show_peek_icon(True)
+        self._pass.connect('activate', self._on_sign_in)
+        box.append(self._pass)
+
+        self._err = Gtk.Label(label='')
+        self._err.add_css_class('error')
+        self._err.set_visible(False)
+        self._err.set_wrap(True)
+        box.append(self._err)
+
+        self._btn = Gtk.Button(label='Sign in')
+        self._btn.add_css_class('suggested-action')
+        self._btn.connect('clicked', self._on_sign_in)
+        box.append(self._btn)
+
+        self._stack.add_named(box, 'login')
+        self._stack.set_visible_child_name('login')
+
+    def _on_sign_in(self, *_):
+        username = self._email.get_text().strip()
+        password = self._pass.get_text()
+        if not username or not password:
+            self._show_err('Email and password are required.')
+            return
+        self._username = username
+        self._password = password
+        self._err.set_visible(False)
+        self._btn.set_sensitive(False)
+        threading.Thread(target=self._auth_thread, daemon=True).start()
+
+    # ----- captcha page -----
+
+    def _show_captcha(self, hv_token):
+        if WebKit is None:
+            self._show_err('webkitgtk not installed — cannot display CAPTCHA.\n'
+                           'Install gir1.2-webkitgtk-6.0 or gir1.2-webkit2-4.1.')
+            return
+
+        ucm = WebKit.UserContentManager()
+        ucm.register_script_message_handler('proton')
+        ucm.connect('script-message-received::proton', self._on_captcha_token)
+
+        inject = """
+window.addEventListener('message', function(e) {
+  if (e.data && e.data.type === 'pm_captcha') {
+    window.webkit.messageHandlers.proton.postMessage(e.data.token);
+  }
+});
+"""
+        try:
+            script = WebKit.UserScript(
+                inject,
+                WebKit.UserContentInjectedFrames.ALL_FRAMES,
+                WebKit.UserScriptInjectionTime.DOCUMENT_START,
+            )
+        except TypeError:
+            script = WebKit.UserScript(
+                inject,
+                WebKit.UserContentInjectedFrames.ALL_FRAMES,
+                WebKit.UserScriptInjectionTime.DOCUMENT_START,
+                None, None,
+            )
+        ucm.add_script(script)
+
+        wv = WebKit.WebView(user_content_manager=ucm)
+        wv.set_vexpand(True)
+        wv.set_hexpand(True)
+
+        url = (f'{PROTON_API}/core/v4/captcha'
+               f'?Token={urllib.parse.quote(hv_token)}&ForceWebMessaging=1')
+        wv.load_uri(url)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        note = Gtk.Label(label='Complete the verification to continue.')
+        note.set_margin_top(8)
+        note.set_margin_bottom(4)
+        box.append(note)
+        box.append(wv)
+
+        self._stack.add_named(box, 'captcha')
+        self._stack.set_visible_child_name('captcha')
+        self.set_default_size(480, 520)
+        self.set_resizable(True)
+
+    def _on_captcha_token(self, _mgr, js_result):
+        try:
+            token = js_result.get_js_value().to_string()   # WebKit 6
+        except AttributeError:
+            token = js_result.get_value().to_string()       # WebKit2 4.x
+        threading.Thread(target=self._auth_hv_thread, args=(token,), daemon=True).start()
+
+    # ----- RPC threads -----
+
+    def _auth_thread(self):
+        try:
+            helper = find_helper()
+            if not helper:
+                GLib.idle_add(self._show_err, 'proton-drive-helper not found.\n'
+                              'Build it: cd helper && go build -o proton-drive-helper .')
+                return
+
+            self._sock = tempfile.mktemp(suffix='.sock', prefix='proton-setup-', dir='/tmp')
+            self._proc = subprocess.Popen(
+                [helper, '--socket', self._sock],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            for _ in range(50):
+                if os.path.exists(self._sock):
+                    break
+                time.sleep(0.1)
+            else:
+                GLib.idle_add(self._show_err, 'Helper failed to start.')
+                return
+
+            resp = rpc_call(self._sock, 'Auth',
+                            {'username': self._username, 'password': self._password})
+            self._handle_auth_resp(resp)
+        except Exception as e:
+            GLib.idle_add(self._show_err, str(e))
+
+    def _auth_hv_thread(self, hv_token):
+        try:
+            resp = rpc_call(self._sock, 'AuthWithHV',
+                            {'username': self._username, 'password': self._password,
+                             'hv_token': hv_token})
+            self._handle_auth_resp(resp)
+        except Exception as e:
+            GLib.idle_add(self._show_err, str(e))
+
+    def _handle_auth_resp(self, resp):
+        if 'error' in resp:
+            code = resp['error'].get('code')
+            if code == -32004:
+                token = (resp['error'].get('details') or {}).get('token', '')
+                GLib.idle_add(self._show_captcha, token)
+            else:
+                msg = resp['error'].get('message', 'Authentication failed.')
+                GLib.idle_add(self._show_err, msg)
         else:
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/html; charset=utf-8')
-            body = page_html.encode()
-            self.send_header('Content-Length', str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-    def log_message(self, *args):
-        pass
+            GLib.idle_add(self._store_and_finish, resp['result'])
 
-server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
-port = server.server_address[1]
+    # ----- success -----
 
-captcha_url = (
-    'https://mail.proton.me/api/core/v4/captcha'
-    f'?Token={urllib.parse.quote(hv_token)}&ForceWebMessaging=1'
-)
+    def _store_and_finish(self, result):
+        u = self._username
+        try:
+            secret_store(f'Proton Drive session UID ({u})', u, 'uid', result['uid'])
+            secret_store(f'Proton Drive refresh token ({u})', u, 'refresh_token', result['refresh_token'])
+            # salted_passphrase is already base64 from JSON; stored as-is so
+            # do_mount can g_base64_decode() it directly.
+            secret_store(f'Proton Drive key passphrase ({u})', u, 'salted_passphrase', result['salted_passphrase'])
+        except Exception as e:
+            self._show_err(f'Failed to store credentials: {e}')
+            return
 
-page_html = f"""<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><title>Proton Drive — Verification</title>
-<style>
-  body {{ margin: 0; display: flex; flex-direction: column;
-         align-items: center; justify-content: center;
-         min-height: 100vh; background: #1c1c1c; color: #fff;
-         font-family: sans-serif; }}
-  p {{ margin-bottom: 12px; }}
-  iframe {{ border: none; width: 400px; height: 300px; }}
-</style>
-</head>
-<body>
-<p>Complete the verification to continue signing in to Proton Drive.</p>
-<iframe src="{captcha_url}"></iframe>
-<script>
-window.addEventListener('message', function(e) {{
-  if (e.data && e.data.type === 'pm_captcha') {{
-    var img = new Image();
-    img.src = 'http://127.0.0.1:{port}/callback?token=' + encodeURIComponent(e.data.token);
-  }}
-}});
-</script>
-</body>
-</html>"""
+        self._cleanup()
 
-webbrowser.open(f'http://127.0.0.1:{port}/')
-server.serve_forever()
+        dlg = Gtk.AlertDialog()
+        dlg.set_message('Setup complete')
+        dlg.set_detail(f'Signed in as {u}.\n\n'
+                       'Proton Drive will appear in Nautilus after the next mount.\n\n'
+                       'To mount now:\n  gvfs-mount "proton:///"')
+        dlg.show(self)
+        self.close()
 
-if result.get('token'):
-    print(result['token'])
-else:
-    sys.exit(1)
-PYEOF
-  )
+    # ----- utils -----
 
-  if [[ -z "$HV_RESPONSE" ]]; then
-    zenity --error --title="Proton Drive Setup" \
-      --text="CAPTCHA was not completed." 2>/dev/null
-    exit 1
-  fi
+    def _show_err(self, msg):
+        self._cleanup()
+        self._err.set_text(msg)
+        self._err.set_visible(True)
+        self._btn.set_sensitive(True)
+        self._stack.set_visible_child_name('login')
 
-  # Retry Auth with the hCaptcha response token
-  AUTH_RESPONSE=$(USERNAME="$USERNAME" PASSWORD="$PASSWORD" HV_TOKEN="$HV_RESPONSE" SOCKET="$SOCKET" \
-    python3 - <<'PYEOF'
-import socket, json, os
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.connect(os.environ["SOCKET"])
-req = json.dumps({"id":1,"method":"AuthWithHV",
-                  "params":{"username":os.environ["USERNAME"],
-                             "password":os.environ["PASSWORD"],
-                             "hv_token":os.environ["HV_TOKEN"]}}) + "\n"
-s.sendall(req.encode())
-data = b""
-while not data.endswith(b"\n"):
-    chunk = s.recv(65536)
-    if not chunk: break
-    data += chunk
-s.close()
-print(data.decode().strip())
-PYEOF
-  )
-  ERROR_CODE=$(echo "$AUTH_RESPONSE" | jq -r '.error.code // empty')
-fi
+    def _cleanup(self):
+        if self._proc:
+            self._proc.terminate()
+            self._proc = None
+        if self._sock and os.path.exists(self._sock):
+            os.unlink(self._sock)
+            self._sock = None
 
-# Any remaining error is fatal
-if [[ -n "$ERROR_CODE" ]]; then
-  MSG=$(echo "$AUTH_RESPONSE" | jq -r '.error.message')
-  zenity --error \
-    --title="Proton Drive — Authentication failed" \
-    --text="$MSG\n\nCheck your credentials and try again." \
-    2>/dev/null || echo "Authentication failed: $MSG" >&2
-  exit 1
-fi
 
-# ---------- extract and store tokens ----------
+# ---------- app ----------
 
-UID_VAL=$(echo       "$AUTH_RESPONSE" | jq -r '.result.uid')
-REFRESH_TOKEN=$(echo "$AUTH_RESPONSE" | jq -r '.result.refresh_token')
-SALTED_PASS=$(echo   "$AUTH_RESPONSE" | jq -r '.result.salted_passphrase')
+class SetupApp(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id='org.gnome.ProtonDrive.Setup')
+        self.connect('activate', lambda app: SetupWindow(app).present())
 
-if [[ -z "$UID_VAL" || "$UID_VAL" == "null" ||
-      -z "$REFRESH_TOKEN" || "$REFRESH_TOKEN" == "null" ||
-      -z "$SALTED_PASS" || "$SALTED_PASS" == "null" ]]; then
-  zenity --error --title="Proton Drive Setup" \
-    --text="Unexpected response — missing token fields." 2>/dev/null
-  exit 1
-fi
 
-printf '%s' "$UID_VAL" | secret-tool store \
-  --label="Proton Drive session UID ($USERNAME)" \
-  schema org.gnome.proton.drive username "$USERNAME" field uid
-
-printf '%s' "$REFRESH_TOKEN" | secret-tool store \
-  --label="Proton Drive refresh token ($USERNAME)" \
-  schema org.gnome.proton.drive username "$USERNAME" field refresh_token
-
-# salted_passphrase is already base64 from the JSON response; store as-is
-# because do_mount calls g_base64_decode() on the value it reads back.
-printf '%s' "$SALTED_PASS" | secret-tool store \
-  --label="Proton Drive key passphrase ($USERNAME)" \
-  schema org.gnome.proton.drive username "$USERNAME" field salted_passphrase
-
-# ---------- done ----------
-
-zenity --info \
-  --title="Proton Drive — Setup complete" \
-  --text="Signed in as <b>$USERNAME</b>.\n\nProton Drive will appear in Nautilus after the next mount.\n\nTo mount now:\n  gvfs-mount \"proton:///\"" \
-  2>/dev/null || echo "Setup complete for $USERNAME"
+if __name__ == '__main__':
+    sys.exit(SetupApp().run(sys.argv))
