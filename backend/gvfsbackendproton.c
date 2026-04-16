@@ -44,6 +44,12 @@ fill_file_info (GFileInfo *info, ProtonEntry *e)
     {
       g_file_info_set_file_type (info, G_FILE_TYPE_REGULAR);
       g_file_info_set_size (info, e->size);
+      gchar *content_type = g_content_type_guess (e->name, NULL, 0, NULL);
+      if (content_type)
+        {
+          g_file_info_set_content_type (info, content_type);
+          g_free (content_type);
+        }
     }
 
   GDateTime *dt = g_date_time_new_from_unix_utc (e->mtime);
