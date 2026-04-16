@@ -187,6 +187,39 @@ A `gvfsd-proton-volume-monitor` daemon that makes the drive appear in Nautilus:
 - **Conflict policy:** last-write-wins for now (matches Proton Drive web
   behaviour). Revisit once revision history API is accessible.
 
+### C4. Caching and offline access
+
+Every file read currently fetches all blocks from the API. Two complementary
+layers are needed:
+
+**Metadata cache (in-process, Track B)**
+
+- Cache `ListDir` and `Stat` results in the helper for a short TTL (e.g. 30 s).
+- Invalidate on write ops and on events received from B4.
+- Eliminates redundant API round-trips when Nautilus re-states files during
+  enumeration or drag-and-drop.
+
+**Block cache / offline store (persistent, Track B+C)**
+
+- Store decrypted (or re-encrypted-for-local-use) file blocks on disk under
+  `~/.cache/proton-drive/<account>/<linkID>/`.
+- Two tiers:
+  - *Read-through:* blocks fetched on demand and kept for a configurable TTL.
+  - *Pinned:* user-marked files/folders synced proactively and kept available
+    without network access.
+- Cache invalidation driven by B4 events; stale entries evicted by a size/age
+  policy (default: 2 GB LRU).
+- **Offline mode:** when the helper cannot reach the API, serve reads from cache
+  and queue writes locally. Flush the write queue and merge on reconnect.
+- Conflict detection on reconnect: compare local mtime against the revision
+  seen in the event stream; flag conflicts rather than silently overwriting.
+
+**Open questions for C4:**
+- Re-encrypt blocks for local storage (avoids storing plaintext on disk) or
+  rely on the OS keyring / full-disk encryption?
+- Pinning UI: extend the volume monitor with a D-Bus method the file manager
+  can call, or ship a separate `proton-drive-pin` CLI?
+
 ---
 
 ## Milestones
@@ -197,6 +230,7 @@ A `gvfsd-proton-volume-monitor` daemon that makes the drive appear in Nautilus:
 | **M2 — Live updates** | B4 + C3 (remote→local) | Nautilus refreshes when remote changes |
 | **M3 — Full read/write** | B3 + C1 (writes) + C3 | Create, edit, move, delete from Nautilus |
 | **M4 — Settings panel** | A3-a or A3-b | Proton Drive in GNOME Settings → Online Accounts |
+| **M5 — Cache + offline** | C4 | Fast repeated access; reads served from disk when offline |
 
 ---
 
