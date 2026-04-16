@@ -47,7 +47,7 @@ type SessionCredentials struct {
 func NewSession(ctx context.Context, mgr *proton.Manager, username, password string) (*Session, SessionCredentials, error) {
 	c, auth, err := mgr.NewClientWithLogin(ctx, username, []byte(password))
 	if err != nil {
-		var apiErr proton.APIError
+		var apiErr *proton.APIError
 		if errors.As(err, &apiErr) && apiErr.IsHVError() {
 			hv, hvErr := apiErr.GetHVDetails()
 			if hvErr == nil {
