@@ -818,7 +818,7 @@ class SetupWindow(Gtk.ApplicationWindow):
         _show_info(self, 'Setup complete',
                    f'Signed in as {u}.\n\n'
                    'Proton Drive will appear in Nautilus after the next mount.\n\n'
-                   'To mount now:\n  gio mount "proton:///"')
+                   f'To mount now:\n  gio mount "proton://{urllib.parse.quote(u, safe="")}/"')
         self.close()
 
     # ----- utils -----

@@ -78,15 +78,17 @@ The password is never written to disk.
 **2. Mount the drive:**
 
 ```sh
-gio mount "proton:///?account=you@proton.me&username=you@proton.me"
+gio mount "proton://you%40proton.me/"
 ```
 
-`gvfsd-proton` will spawn `proton-drive-helper`, wait for the socket, authenticate, and the volume will appear in Nautilus as **Proton Drive**. Opening files and browsing directories works read-only at this stage.
+The `@` in the email must be percent-encoded as `%40` so GVfs passes it through as the host field.
+
+`gvfsd-proton` will spawn `proton-drive-helper`, wait for the socket, authenticate, and the volume will appear in Nautilus as **Proton Drive (you@proton.me)**. Opening files and browsing directories works read-only at this stage.
 
 **To unmount:**
 
 ```sh
-gio mount -u "proton:///?account=you@proton.me&username=you@proton.me"
+gio mount -u "proton://you%40proton.me/"
 ```
 
 ## RPC protocol reference

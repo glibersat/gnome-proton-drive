@@ -89,24 +89,26 @@ do_mount (GVfsBackend  *backend,
 {
   GVfsBackendProton *self = G_VFS_BACKEND_PROTON (backend);
 
-  const gchar *account  = g_mount_spec_get (mount_spec, "account");
-  const gchar *username = g_mount_spec_get (mount_spec, "username");
+  /* GVfs maps URI host → "host" mount spec key; we store the full email
+   * address there (@ encoded as %40 in the URI so GVfs passes it through).
+   * URI: proton://glibersat%40sigill.org/ */
+  const gchar *account = g_mount_spec_get (mount_spec, "host");
+
+  if (!account || *account == '\0')
+    {
+      g_vfs_job_failed_literal (G_VFS_JOB (job), G_IO_ERROR,
+                                G_IO_ERROR_INVALID_ARGUMENT,
+                                "URI must contain the account email as host, "
+                                "e.g. proton://you%40example.com/");
+      return;
+    }
 
   gchar *socket_path = g_strdup_printf ("/run/user/%u/proton-drive-%s.sock",
-                                        getuid (), account ? account : "default");
+                                        getuid (), account);
 
   /* Spawn the helper if its socket isn't already listening. */
   if (!g_file_test (socket_path, G_FILE_TEST_EXISTS))
     {
-      if (!account)
-        {
-          g_vfs_job_failed_literal (G_VFS_JOB (job), G_IO_ERROR,
-                                    G_IO_ERROR_INVALID_ARGUMENT,
-                                    "mount spec missing required 'account' key");
-          g_free (socket_path);
-          return;
-        }
-
       gchar *helper = find_helper_binary ();
       if (!helper)
         {
@@ -160,28 +162,27 @@ do_mount (GVfsBackend  *backend,
   gchar *refresh_token     = NULL;
   gchar *salted_pass_b64   = NULL;
 
-  if (username)
-    {
-      gint exit_status;
+  {
+    gint exit_status;
 
 #define LOOKUP_FIELD(field, out) \
-      { \
-        gchar *argv[] = { "secret-tool", "lookup", \
-                          "schema",   "org.gnome.proton.drive", \
-                          "username", (gchar *) username, \
-                          "field",    field, NULL }; \
-        g_spawn_sync (NULL, argv, NULL, \
-                      G_SPAWN_SEARCH_PATH | G_SPAWN_STDERR_TO_DEV_NULL, \
-                      NULL, NULL, &(out), NULL, &exit_status, &error); \
-        if (error) goto cred_error; \
-        g_strchomp (out); \
-      }
-
-      LOOKUP_FIELD ("uid",               uid)
-      LOOKUP_FIELD ("refresh_token",     refresh_token)
-      LOOKUP_FIELD ("salted_passphrase", salted_pass_b64)
-#undef LOOKUP_FIELD
+    { \
+      gchar *argv[] = { "secret-tool", "lookup", \
+                        "schema",   "org.gnome.proton.drive", \
+                        "username", (gchar *) account, \
+                        "field",    field, NULL }; \
+      g_spawn_sync (NULL, argv, NULL, \
+                    G_SPAWN_SEARCH_PATH | G_SPAWN_STDERR_TO_DEV_NULL, \
+                    NULL, NULL, &(out), NULL, &exit_status, &error); \
+      if (error) goto cred_error; \
+      g_strchomp (out); \
     }
+
+    LOOKUP_FIELD ("uid",               uid)
+    LOOKUP_FIELD ("refresh_token",     refresh_token)
+    LOOKUP_FIELD ("salted_passphrase", salted_pass_b64)
+#undef LOOKUP_FIELD
+  }
 
   if (!uid || !refresh_token || !salted_pass_b64)
     {
@@ -224,14 +225,13 @@ cred_cleanup:
     }
 
   GMountSpec *spec = g_mount_spec_new ("proton");
-  if (account)
-    g_mount_spec_set (spec, "account", account);
-  if (username)
-    g_mount_spec_set (spec, "username", username);
+  g_mount_spec_set (spec, "host", account);
 
   g_vfs_backend_set_mount_spec (backend, spec);
   g_mount_spec_unref (spec);
-  g_vfs_backend_set_display_name (backend, "Proton Drive");
+  gchar *display = g_strdup_printf ("Proton Drive (%s)", account);
+  g_vfs_backend_set_display_name (backend, display);
+  g_free (display);
   g_vfs_backend_set_icon_name (backend, "folder-remote");
   g_vfs_backend_set_symbolic_icon_name (backend, "folder-remote-symbolic");
   g_vfs_backend_set_user_visible (backend, TRUE);
