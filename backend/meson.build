@@ -10,6 +10,24 @@ gio_dep      = dependency('gio-2.0',     version: '>= 2.76')
 gio_unix_dep = dependency('gio-unix-2.0')
 json_glib_dep = dependency('json-glib-1.0')
 
+# Ask GVfs where it keeps its backends and mount descriptors.
+# These are set at GVfs build time and may differ from our own prefix.
+gvfs_dep       = dependency('gvfs', required: false)
+gvfs_backend_dir = get_option('gvfs-backend-dir')
+gvfs_mount_dir   = get_option('gvfs-mount-dir')
+if gvfs_backend_dir == ''
+  gvfs_backend_dir = gvfs_dep.found() \
+    ? gvfs_dep.get_variable(pkgconfig: 'gvfsbackenddir') \
+    : '/usr/lib/gvfs'
+endif
+if gvfs_mount_dir == ''
+  gvfs_mount_dir = gvfs_dep.found() \
+    ? gvfs_dep.get_variable(pkgconfig: 'gvfsmountdir') \
+    : '/usr/share/gvfs/mounts'
+endif
+message('GVfs backend dir : ' + gvfs_backend_dir)
+message('GVfs mount dir   : ' + gvfs_mount_dir)
+
 # GVfs daemon private library — not installed with headers, so we vendor
 # the headers from the matching source tree under gvfs-headers/.
 gvfs_daemon_lib  = cc.find_library('gvfsdaemon',
@@ -42,16 +60,20 @@ gvfsd_proton = executable(
   dependencies: [glib_dep, gio_dep, gio_unix_dep, json_glib_dep,
                  gvfs_daemon_lib, gvfs_common_lib],
   install: true,
-  install_dir: get_option('libexecdir'),
+  install_dir: gvfs_backend_dir,
 )
 
-# Mount descriptor — @libexecdir@ is substituted at install time
+# Mount descriptor — Exec path points into the GVfs backend dir
 configure_file(
   input:  'proton.mount',
   output: 'proton.mount',
-  configuration: {'libexecdir': get_option('prefix') / get_option('libexecdir')},
+  configuration: {'libexecdir': gvfs_backend_dir},
   install: true,
-  install_dir: get_option('datadir') / 'gvfs' / 'mounts',
+  install_dir: gvfs_mount_dir,
 )
+
+# Restart the GVfs daemon after install so it picks up the new backend.
+meson.add_install_script('sh', '-c',
+  'gvfsd --replace &')
 
 subdir('tests')

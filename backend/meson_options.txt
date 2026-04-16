@@ -1,0 +1,9 @@
+option('gvfs-backend-dir',
+  type: 'string', value: '',
+  description: 'Directory where GVfs daemon backends are installed '
+             + '(default: auto-detected from pkg-config gvfs)')
+
+option('gvfs-mount-dir',
+  type: 'string', value: '',
+  description: 'Directory where GVfs .mount files are installed '
+             + '(default: auto-detected from pkg-config gvfs)')
