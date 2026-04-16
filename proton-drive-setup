@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# proton-drive-setup — one-time credential setup for gnome-proton.
+#
+# Prompts for Proton credentials via zenity dialogs, performs a full SRP
+# login through proton-drive-helper, then stores the resulting session
+# tokens (uid, refresh_token, salted_passphrase) in the GNOME keyring via
+# libsecret. The password is never written to disk.
+#
+# Requirements: zenity, jq, python3, secret-tool, proton-drive-helper
+
+set -euo pipefail
+
+# ---------- locate helper binary ----------
+
+find_helper() {
+  local candidates=(
+    "$(dirname "$(realpath "$0")")/helper/proton-drive-helper"
+    /usr/local/libexec/proton-drive-helper
+    /usr/libexec/proton-drive-helper
+  )
+  for c in "${candidates[@]}"; do
+    [[ -x "$c" ]] && { echo "$c"; return; }
+  done
+  command -v proton-drive-helper 2>/dev/null && return
+  echo ""
+}
+
+HELPER=$(find_helper)
+if [[ -z "$HELPER" ]]; then
+  zenity --error \
+    --title="Proton Drive Setup" \
+    --text="proton-drive-helper not found.\n\nBuild it first:\n  cd helper && go build -o proton-drive-helper ." \
+    2>/dev/null || echo "ERROR: proton-drive-helper not found." >&2
+  exit 1
+fi
+
+# ---------- credential prompt ----------
+
+USERNAME=$(zenity \
+  --entry \
+  --title="Proton Drive — Sign in" \
+  --text="Proton account email:" \
+  --entry-text="" \
+  2>/dev/null) || { echo "Cancelled."; exit 0; }
+
+[[ -z "$USERNAME" ]] && {
+  zenity --error --title="Proton Drive Setup" --text="Email address is required." 2>/dev/null
+  exit 1
+}
+
+PASSWORD=$(zenity \
+  --password \
+  --title="Proton Drive — Sign in" \
+  2>/dev/null) || { echo "Cancelled."; exit 0; }
+
+[[ -z "$PASSWORD" ]] && {
+  zenity --error --title="Proton Drive Setup" --text="Password is required." 2>/dev/null
+  exit 1
+}
+
+# ---------- start helper on a temporary socket ----------
+
+SOCKET=$(mktemp -u /tmp/proton-setup-XXXXXX.sock)
+
+cleanup() {
+  [[ -n "${HELPER_PID:-}" ]] && kill "$HELPER_PID" 2>/dev/null || true
+  rm -f "$SOCKET"
+}
+trap cleanup EXIT
+
+"$HELPER" --socket "$SOCKET" &
+HELPER_PID=$!
+
+# Poll until socket appears (up to 5 s)
+for _ in $(seq 1 50); do
+  [[ -S "$SOCKET" ]] && break
+  sleep 0.1
+done
+
+[[ -S "$SOCKET" ]] || {
+  zenity --error --title="Proton Drive Setup" \
+    --text="proton-drive-helper failed to start (socket never appeared)." 2>/dev/null
+  exit 1
+}
+
+# ---------- perform Auth RPC via python3 ----------
+# Python3 is used to speak line-delimited JSON over the Unix socket.
+# Credentials are passed via environment variables, never via argv.
+
+RESPONSE=$(USERNAME="$USERNAME" PASSWORD="$PASSWORD" SOCKET="$SOCKET" \
+  python3 - <<'PYEOF'
+import socket, json, os, sys
+
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(os.environ["SOCKET"])
+
+req = json.dumps({
+    "id": 1,
+    "method": "Auth",
+    "params": {
+        "username": os.environ["USERNAME"],
+        "password": os.environ["PASSWORD"],
+    }
+}) + "\n"
+
+s.sendall(req.encode())
+
+data = b""
+while not data.endswith(b"\n"):
+    chunk = s.recv(4096)
+    if not chunk:
+        break
+    data += chunk
+
+s.close()
+print(data.decode().strip())
+PYEOF
+)
+
+# Check for RPC-level error
+if echo "$RESPONSE" | jq -e '.error' >/dev/null 2>&1; then
+  MSG=$(echo "$RESPONSE" | jq -r '.error.message')
+  zenity --error \
+    --title="Proton Drive — Authentication failed" \
+    --text="$MSG\n\nCheck your email and password and try again." \
+    2>/dev/null || echo "Authentication failed: $MSG" >&2
+  exit 1
+fi
+
+# ---------- extract tokens ----------
+
+UID_VAL=$(echo        "$RESPONSE" | jq -r '.result.uid')
+REFRESH_TOKEN=$(echo  "$RESPONSE" | jq -r '.result.refresh_token')
+SALTED_PASS=$(echo    "$RESPONSE" | jq -r '.result.salted_passphrase')
+
+if [[ -z "$UID_VAL" || "$UID_VAL" == "null" ||
+      -z "$REFRESH_TOKEN" || "$REFRESH_TOKEN" == "null" ||
+      -z "$SALTED_PASS" || "$SALTED_PASS" == "null" ]]; then
+  zenity --error --title="Proton Drive Setup" \
+    --text="Unexpected response from helper — missing token fields." 2>/dev/null
+  exit 1
+fi
+
+# ---------- store in libsecret ----------
+# Three separate entries under the same schema+username, differentiated by
+# the 'field' attribute so secret-tool can look them up individually.
+
+printf '%s' "$UID_VAL" | secret-tool store \
+  --label="Proton Drive session UID ($USERNAME)" \
+  schema   org.gnome.proton.drive \
+  username "$USERNAME" \
+  field    uid
+
+printf '%s' "$REFRESH_TOKEN" | secret-tool store \
+  --label="Proton Drive refresh token ($USERNAME)" \
+  schema   org.gnome.proton.drive \
+  username "$USERNAME" \
+  field    refresh_token
+
+# salted_passphrase is already base64 from the JSON response; store as-is
+# because do_mount calls g_base64_decode() on the value it reads back.
+printf '%s' "$SALTED_PASS" | secret-tool store \
+  --label="Proton Drive key passphrase ($USERNAME)" \
+  schema   org.gnome.proton.drive \
+  username "$USERNAME" \
+  field    salted_passphrase
+
+# ---------- done ----------
+
+zenity --info \
+  --title="Proton Drive — Setup complete" \
+  --text="Signed in as <b>$USERNAME</b>.\n\nProton Drive will appear in Nautilus after the next mount.\n\nTo mount now:\n  gvfs-mount \"proton:///\"" \
+  2>/dev/null || echo "Setup complete for $USERNAME"
