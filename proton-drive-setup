@@ -210,15 +210,15 @@ class SetupWindow(Gtk.ApplicationWindow):
 
     # ----- captcha page -----
 
-    def _show_captcha(self, hv_token):
-        print(f'[setup] _show_captcha called, WebKit={WebKit}', file=sys.stderr)
+    def _show_captcha(self, hv_token, captcha_html=''):
+        print(f'[setup] _show_captcha called, html_len={len(captcha_html)}', file=sys.stderr)
         try:
-            self._show_captcha_inner(hv_token)
+            self._show_captcha_inner(hv_token, captcha_html)
         except Exception:
             import traceback; traceback.print_exc()
             self._show_err('Failed to display CAPTCHA — see terminal for details.')
 
-    def _show_captcha_inner(self, hv_token):
+    def _show_captcha_inner(self, hv_token, captcha_html=''):
         if WebKit is None:
             self._show_err('webkitgtk not installed — cannot display CAPTCHA.\n'
                            'Install gir1.2-webkitgtk-6.0 or gir1.2-webkit2-4.1.')
@@ -256,9 +256,17 @@ window.addEventListener('message', function(e) {
         wv.set_vexpand(True)
         wv.set_hexpand(True)
 
-        url = (f'{PROTON_API}/core/v4/captcha'
-               f'?Token={urllib.parse.quote(hv_token)}&ForceWebMessaging=1')
-        wv.load_uri(url)
+        # Load the captcha HTML with mail.proton.me as the base URI so that
+        # relative asset URLs (e.g. /captcha/v1/assets/…) resolve to Proton's
+        # servers, X-Frame-Options SAMEORIGIN is satisfied for sub-frames, and
+        # the injected UserScript can intercept pm_captcha postMessage events.
+        if captcha_html:
+            wv.load_html(captcha_html, 'https://mail.proton.me/')
+        else:
+            # Fallback: load the URL directly (may render blank if auth headers missing)
+            url = (f'{PROTON_API}/core/v4/captcha'
+                   f'?Token={urllib.parse.quote(hv_token)}&ForceWebMessaging=1')
+            wv.load_uri(url)
 
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         note = Gtk.Label(label='Complete the verification to continue.')
@@ -336,8 +344,16 @@ window.addEventListener('message', function(e) {
         if 'error' in resp:
             code = resp['error'].get('code')
             if code == -32004:
-                token = (resp['error'].get('details') or {}).get('token', '')
-                GLib.idle_add(self._show_captcha, token)
+                hv_token = (resp['error'].get('details') or {}).get('token', '')
+                # Fetch captcha HTML through the helper — it already holds the
+                # API connection with proper headers so the response is complete.
+                try:
+                    cr = rpc_call(self._sock, 'GetCaptcha', {'hv_token': hv_token})
+                    captcha_html = cr.get('result', {}).get('html', '')
+                    print(f'[setup] captcha HTML length: {len(captcha_html)}', file=sys.stderr)
+                except Exception:
+                    captcha_html = ''
+                GLib.idle_add(self._show_captcha, hv_token, captcha_html)
             else:
                 msg = resp['error'].get('message', 'Authentication failed.')
                 GLib.idle_add(self._show_err, msg)
