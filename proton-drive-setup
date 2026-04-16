@@ -256,14 +256,19 @@ window.addEventListener('message', function(e) {
         wv.set_vexpand(True)
         wv.set_hexpand(True)
 
-        # Load the captcha HTML with mail.proton.me as the base URI so that
-        # relative asset URLs (e.g. /captcha/v1/assets/…) resolve to Proton's
-        # servers, X-Frame-Options SAMEORIGIN is satisfied for sub-frames, and
-        # the injected UserScript can intercept pm_captcha postMessage events.
+        def on_load_changed(wv, event):
+            print(f'[setup] webview load event: {event}', file=sys.stderr)
+        def on_load_failed(wv, event, uri, error):
+            print(f'[setup] webview load FAILED: {uri!r} — {error}', file=sys.stderr)
+            return False
+        wv.connect('load-changed', on_load_changed)
+        wv.connect('load-failed', on_load_failed)
+
+        print(f'[setup] captcha HTML preview:\n{captcha_html[:1500]}', file=sys.stderr)
+
         if captcha_html:
             wv.load_html(captcha_html, 'https://mail.proton.me/')
         else:
-            # Fallback: load the URL directly (may render blank if auth headers missing)
             url = (f'{PROTON_API}/core/v4/captcha'
                    f'?Token={urllib.parse.quote(hv_token)}&ForceWebMessaging=1')
             wv.load_uri(url)
