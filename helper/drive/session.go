@@ -21,6 +21,7 @@ type Session struct {
 	shareID string
 	rootID  string
 	addrKR  *crypto.KeyRing           // primary address keyring
+	shareKR *crypto.KeyRing           // share keyring (unlocked with addrKR)
 	nodeKRs map[string]*crypto.KeyRing // linkID → decrypted node keyring (cache)
 }
 
@@ -186,7 +187,10 @@ func (s *Session) Stat(ctx context.Context, p string) (proton.Link, *crypto.KeyR
 	p = path.Clean("/" + p)
 	if p == "/" {
 		link, err := s.client.GetLink(ctx, s.shareID, s.rootID)
-		kr, _ := s.shareKeyRing(ctx)
+		if err != nil {
+			return proton.Link{}, nil, err
+		}
+		kr, err := s.rootNodeKeyRing(ctx)
 		return link, kr, err
 	}
 
@@ -273,7 +277,7 @@ func (s *Session) resolvePath(ctx context.Context, p string) (string, *crypto.Ke
 	parts := splitPath(p)
 	linkID := s.rootID
 
-	kr, err := s.shareKeyRing(ctx)
+	kr, err := s.rootNodeKeyRing(ctx)
 	if err != nil {
 		return "", nil, err
 	}
@@ -318,21 +322,43 @@ func (s *Session) parentKRFor(ctx context.Context, p string) (*crypto.KeyRing, e
 	return kr, err
 }
 
+// shareKeyRing returns the keyring for the Drive share itself (used to unlock
+// the root node key). Cached after first fetch.
 func (s *Session) shareKeyRing(ctx context.Context) (*crypto.KeyRing, error) {
-	if kr, ok := s.nodeKRs[s.rootID]; ok {
-		return kr, nil
+	if s.shareKR != nil {
+		return s.shareKR, nil
 	}
-
 	share, err := s.client.GetShare(ctx, s.shareID)
 	if err != nil {
 		return nil, err
 	}
-
 	kr, err := share.GetKeyRing(s.addrKR)
 	if err != nil {
 		return nil, err
 	}
+	s.shareKR = kr
+	return kr, nil
+}
 
+// rootNodeKeyRing returns the node keyring for the root folder. Children's
+// names and keys are encrypted with the parent's NODE keyring, so listing
+// root's children requires the root link's node keyring, not the share keyring.
+func (s *Session) rootNodeKeyRing(ctx context.Context) (*crypto.KeyRing, error) {
+	if kr, ok := s.nodeKRs[s.rootID]; ok {
+		return kr, nil
+	}
+	shareKR, err := s.shareKeyRing(ctx)
+	if err != nil {
+		return nil, err
+	}
+	rootLink, err := s.client.GetLink(ctx, s.shareID, s.rootID)
+	if err != nil {
+		return nil, err
+	}
+	kr, err := rootLink.GetKeyRing(shareKR, s.addrKR)
+	if err != nil {
+		return nil, err
+	}
 	s.nodeKRs[s.rootID] = kr
 	return kr, nil
 }
