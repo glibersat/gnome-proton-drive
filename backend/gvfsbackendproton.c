@@ -1,6 +1,7 @@
 #include "gvfsbackendproton.h"
 #include "proton-rpc.h"
 
+#include <gvfsjob.h>
 #include <gvfsjobmount.h>
 #include <gvfsjobqueryinfo.h>
 #include <gvfsjobenumerate.h>
@@ -489,7 +490,9 @@ do_query_info (GVfsBackend           *backend,
   GVfsBackendProton *self = G_VFS_BACKEND_PROTON (backend);
   GError *error = NULL;
 
-  ProtonEntry *e = proton_rpc_stat (self->rpc, filename, &error);
+  ProtonEntry *e = proton_rpc_stat (self->rpc, filename,
+                                     G_VFS_JOB (job)->cancellable,
+                                     &error);
   if (!e)
     {
       g_vfs_job_failed_from_error (G_VFS_JOB (job), error);
@@ -512,7 +515,9 @@ do_enumerate (GVfsBackend           *backend,
   GVfsBackendProton *self = G_VFS_BACKEND_PROTON (backend);
   GError *error = NULL;
 
-  ProtonEntry **entries = proton_rpc_list_dir (self->rpc, filename, &error);
+  ProtonEntry **entries = proton_rpc_list_dir (self->rpc, filename,
+                                               G_VFS_JOB (job)->cancellable,
+                                               &error);
   if (!entries)
     {
       g_vfs_job_failed_from_error (G_VFS_JOB (job), error);
@@ -542,7 +547,9 @@ do_open_for_read (GVfsBackend        *backend,
   GError *error = NULL;
 
   /* Verify the path exists and is a file before handing back a handle. */
-  ProtonEntry *e = proton_rpc_stat (self->rpc, filename, &error);
+  ProtonEntry *e = proton_rpc_stat (self->rpc, filename,
+                                    G_VFS_JOB (job)->cancellable,
+                                    &error);
   if (!e)
     {
       g_vfs_job_failed_from_error (G_VFS_JOB (job), error);
@@ -580,7 +587,9 @@ do_read (GVfsBackend      *backend,
 
   gssize n = proton_rpc_read_file (self->rpc, h->path, h->offset,
                                    (gint64) bytes_requested,
-                                   (guchar *) buffer, &eof, &error);
+                                   (guchar *) buffer, &eof,
+                                   G_VFS_JOB (job)->cancellable,
+                                   &error);
   if (n < 0)
     {
       g_vfs_job_failed_from_error (G_VFS_JOB (job), error);

@@ -9,6 +9,7 @@ struct _ProtonRpc {
   GOutputStream     *writer;
   GMutex             lock;
   guint64            next_id;
+  gchar             *socket_path;
 };
 
 /* ---------- helpers ---------- */
@@ -49,10 +50,13 @@ send_request (ProtonRpc *rpc, JsonNode *req, GError **error)
 
 /* Returns a new reference to the parsed response object, or NULL on error. */
 static JsonObject *
-recv_response (ProtonRpc *rpc, G_GNUC_UNUSED guint64 expected_id, GError **error)
+recv_response (ProtonRpc    *rpc,
+               guint64       G_GNUC_UNUSED expected_id,
+               GCancellable *cancellable,
+               GError      **error)
 {
   gsize len;
-  gchar *line = g_data_input_stream_read_line (rpc->reader, &len, NULL, error);
+  gchar *line = g_data_input_stream_read_line (rpc->reader, &len, cancellable, error);
   if (!line)
     return NULL;
 
@@ -77,10 +81,34 @@ recv_response (ProtonRpc *rpc, G_GNUC_UNUSED guint64 expected_id, GError **error
   return json_object_ref (obj);
 }
 
+static gboolean
+reconnect (ProtonRpc *rpc, GError **error)
+{
+  g_clear_object (&rpc->reader);
+  g_clear_object (&rpc->conn);
+
+  g_autoptr(GSocketClient) client = g_socket_client_new ();
+  g_autoptr(GUnixSocketAddress) addr =
+    (GUnixSocketAddress *) g_unix_socket_address_new (rpc->socket_path);
+
+  GSocketConnection *conn = g_socket_client_connect (
+    client, (GSocketConnectable *) addr, NULL, error);
+  if (!conn)
+    return FALSE;
+
+  rpc->conn   = conn;
+  rpc->writer = g_io_stream_get_output_stream (G_IO_STREAM (conn));
+  GInputStream *raw = g_io_stream_get_input_stream (G_IO_STREAM (conn));
+  rpc->reader = g_data_input_stream_new (raw);
+  g_data_input_stream_set_newline_type (rpc->reader, G_DATA_STREAM_NEWLINE_TYPE_LF);
+  return TRUE;
+}
+
 static JsonObject *
 call (ProtonRpc    *rpc,
       const gchar  *method,
       JsonBuilder  *params,
+      GCancellable *cancellable,
       GError      **error)
 {
   g_mutex_lock (&rpc->lock);
@@ -93,7 +121,26 @@ call (ProtonRpc    *rpc,
       return NULL;
     }
 
-  JsonObject *resp = recv_response (rpc, id, error);
+  GError *local_err = NULL;
+  JsonObject *resp = recv_response (rpc, id, cancellable, &local_err);
+
+  if (!resp && g_error_matches (local_err, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+    {
+      GError *reconnect_err = NULL;
+      if (!reconnect (rpc, &reconnect_err))
+        {
+          g_warning ("proton-rpc: reconnect after cancel failed: %s",
+                     reconnect_err->message);
+          g_error_free (reconnect_err);
+        }
+      g_propagate_error (error, local_err);
+      g_mutex_unlock (&rpc->lock);
+      return NULL;
+    }
+
+  if (local_err)
+    g_propagate_error (error, local_err);
+
   g_mutex_unlock (&rpc->lock);
   return resp;
 }
@@ -112,14 +159,15 @@ proton_rpc_new (const gchar *socket_path, GError **error)
   if (!conn)
     return NULL;
 
-  ProtonRpc *rpc  = g_new0 (ProtonRpc, 1);
-  rpc->conn       = conn; /* takes ownership */
-  rpc->writer     = g_io_stream_get_output_stream (G_IO_STREAM (conn));
+  ProtonRpc *rpc    = g_new0 (ProtonRpc, 1);
+  rpc->socket_path  = g_strdup (socket_path);
+  rpc->conn         = conn; /* takes ownership */
+  rpc->writer       = g_io_stream_get_output_stream (G_IO_STREAM (conn));
   GInputStream *raw = g_io_stream_get_input_stream (G_IO_STREAM (conn));
-  rpc->reader     = g_data_input_stream_new (raw);
+  rpc->reader       = g_data_input_stream_new (raw);
   g_data_input_stream_set_newline_type (rpc->reader, G_DATA_STREAM_NEWLINE_TYPE_LF);
   g_mutex_init (&rpc->lock);
-  rpc->next_id    = 1;
+  rpc->next_id      = 1;
   return rpc;
 }
 
@@ -131,6 +179,7 @@ proton_rpc_free (ProtonRpc *rpc)
   g_object_unref (rpc->reader);
   g_object_unref (rpc->conn);
   g_mutex_clear (&rpc->lock);
+  g_free (rpc->socket_path);
   g_free (rpc);
 }
 
@@ -151,7 +200,7 @@ proton_rpc_auth (ProtonRpc    *rpc,
   json_builder_add_string_value (b, password);
   json_builder_end_object (b);
 
-  g_autoptr(JsonObject) resp = call (rpc, "Auth", b, error);
+  g_autoptr(JsonObject) resp = call (rpc, "Auth", b, NULL, error);
   if (!resp)
     return FALSE;
 
@@ -196,7 +245,7 @@ proton_rpc_resume_session (ProtonRpc    *rpc,
   json_builder_end_object (b);
   g_free (sp_b64);
 
-  g_autoptr(JsonObject) resp = call (rpc, "ResumeSession", b, error);
+  g_autoptr(JsonObject) resp = call (rpc, "ResumeSession", b, NULL, error);
   if (!resp)
     return FALSE;
 
@@ -210,9 +259,10 @@ proton_rpc_resume_session (ProtonRpc    *rpc,
 }
 
 ProtonEntry **
-proton_rpc_list_dir (ProtonRpc   *rpc,
-                     const gchar *path,
-                     GError     **error)
+proton_rpc_list_dir (ProtonRpc    *rpc,
+                     const gchar  *path,
+                     GCancellable *cancellable,
+                     GError      **error)
 {
   g_autoptr(JsonBuilder) b = json_builder_new ();
   json_builder_begin_object (b);
@@ -220,7 +270,7 @@ proton_rpc_list_dir (ProtonRpc   *rpc,
   json_builder_add_string_value (b, path);
   json_builder_end_object (b);
 
-  g_autoptr(JsonObject) resp = call (rpc, "ListDir", b, error);
+  g_autoptr(JsonObject) resp = call (rpc, "ListDir", b, cancellable, error);
   if (!resp)
     return NULL;
 
@@ -248,9 +298,10 @@ proton_rpc_list_dir (ProtonRpc   *rpc,
 }
 
 ProtonEntry *
-proton_rpc_stat (ProtonRpc   *rpc,
-                 const gchar *path,
-                 GError     **error)
+proton_rpc_stat (ProtonRpc    *rpc,
+                 const gchar  *path,
+                 GCancellable *cancellable,
+                 GError      **error)
 {
   g_autoptr(JsonBuilder) b = json_builder_new ();
   json_builder_begin_object (b);
@@ -258,7 +309,7 @@ proton_rpc_stat (ProtonRpc   *rpc,
   json_builder_add_string_value (b, path);
   json_builder_end_object (b);
 
-  g_autoptr(JsonObject) resp = call (rpc, "Stat", b, error);
+  g_autoptr(JsonObject) resp = call (rpc, "Stat", b, cancellable, error);
   if (!resp)
     return NULL;
 
@@ -276,13 +327,14 @@ proton_rpc_stat (ProtonRpc   *rpc,
 }
 
 gssize
-proton_rpc_read_file (ProtonRpc   *rpc,
-                      const gchar *path,
-                      gint64       offset,
-                      gint64       length,
-                      guchar      *buf,
-                      gboolean    *eof,
-                      GError     **error)
+proton_rpc_read_file (ProtonRpc    *rpc,
+                      const gchar  *path,
+                      gint64        offset,
+                      gint64        length,
+                      guchar       *buf,
+                      gboolean     *eof,
+                      GCancellable *cancellable,
+                      GError      **error)
 {
   g_autoptr(JsonBuilder) b = json_builder_new ();
   json_builder_begin_object (b);
@@ -294,7 +346,7 @@ proton_rpc_read_file (ProtonRpc   *rpc,
   json_builder_add_int_value (b, length);
   json_builder_end_object (b);
 
-  g_autoptr(JsonObject) resp = call (rpc, "ReadFile", b, error);
+  g_autoptr(JsonObject) resp = call (rpc, "ReadFile", b, cancellable, error);
   if (!resp)
     return -1;
 
@@ -327,7 +379,7 @@ proton_entry_free (ProtonEntry *entry)
 ProtonEvent **
 proton_rpc_get_events (ProtonRpc *rpc, GError **error)
 {
-  g_autoptr(JsonObject) resp = call (rpc, "GetEvents", NULL, error);
+  g_autoptr(JsonObject) resp = call (rpc, "GetEvents", NULL, NULL, error);
   if (!resp)
     return NULL;
 

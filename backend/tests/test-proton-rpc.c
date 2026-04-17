@@ -196,7 +196,7 @@ test_list_dir (void)
   ProtonRpc *rpc   = proton_rpc_new (srv->socket_path, &error);
   g_assert_nonnull (rpc);
 
-  ProtonEntry **entries = proton_rpc_list_dir (rpc, "/", &error);
+  ProtonEntry **entries = proton_rpc_list_dir (rpc, "/", NULL, &error);
   g_assert_no_error (error);
   g_assert_nonnull (entries);
   g_assert_nonnull (entries[0]);
@@ -230,7 +230,7 @@ test_stat (void)
   ProtonRpc *rpc   = proton_rpc_new (srv->socket_path, &error);
   g_assert_nonnull (rpc);
 
-  ProtonEntry *e = proton_rpc_stat (rpc, "/notes.txt", &error);
+  ProtonEntry *e = proton_rpc_stat (rpc, "/notes.txt", NULL, &error);
   g_assert_no_error (error);
   g_assert_nonnull (e);
   g_assert_cmpstr (e->name,  ==, "notes.txt");
@@ -258,7 +258,7 @@ test_read_file (void)
 
   guchar   buf[16] = {0};
   gboolean eof     = FALSE;
-  gssize   n       = proton_rpc_read_file (rpc, "/notes.txt", 0, 16, buf, &eof, &error);
+  gssize   n       = proton_rpc_read_file (rpc, "/notes.txt", 0, 16, buf, &eof, NULL, &error);
 
   g_assert_no_error (error);
   g_assert_cmpint (n, ==, 5);
@@ -281,7 +281,7 @@ test_not_found (void)
   ProtonRpc *rpc   = proton_rpc_new (srv->socket_path, &error);
   g_assert_nonnull (rpc);
 
-  ProtonEntry *e = proton_rpc_stat (rpc, "/missing.txt", &error);
+  ProtonEntry *e = proton_rpc_stat (rpc, "/missing.txt", NULL, &error);
   g_assert_null (e);
   g_assert_nonnull (error);
   g_error_free (error);

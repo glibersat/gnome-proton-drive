@@ -47,13 +47,17 @@ gboolean    proton_rpc_resume_session (ProtonRpc    *rpc,
                                        GError      **error);
 
 /* Returns a NULL-terminated array of ProtonEntry* owned by the caller.
- * Free each entry with proton_entry_free(), then g_free() the array. */
+ * Free each entry with proton_entry_free(), then g_free() the array.
+ * Pass a GCancellable to abort the blocking socket read; on cancellation
+ * the RPC connection is automatically reconnected for the next call. */
 ProtonEntry **proton_rpc_list_dir   (ProtonRpc    *rpc,
                                      const gchar  *path,
+                                     GCancellable *cancellable,
                                      GError      **error);
 
 ProtonEntry  *proton_rpc_stat       (ProtonRpc    *rpc,
                                      const gchar  *path,
+                                     GCancellable *cancellable,
                                      GError      **error);
 
 /* Read up to @length bytes from @path at @offset.
@@ -65,6 +69,7 @@ gssize        proton_rpc_read_file  (ProtonRpc    *rpc,
                                      gint64        length,
                                      guchar       *buf,
                                      gboolean     *eof,
+                                     GCancellable *cancellable,
                                      GError      **error);
 
 void          proton_entry_free     (ProtonEntry  *entry);
