@@ -239,9 +239,21 @@ func (p *EventPoller) handle(le proton.LinkEvent) {
 		// Unknown path: fall through to CHANGED for the parent directory.
 		et = EventChanged
 	case proton.LinkEventCreate:
-		// The new file's path is always unknown at event time; use the parent
-		// directory path and emit CHANGED so the C backend re-enumerates it.
+		// Try to decrypt the new link's name from the event payload using the
+		// parent's cached NodeKeyRing. If successful, emit CREATED with the full
+		// child path so Nautilus adds the entry immediately. If the parent keyring
+		// is not yet cached, fall back to CHANGED on the parent directory.
 		et = EventChanged
+		if parentPath != "" {
+			if parentKR, ok := p.s.nodeKRs[parentID]; ok {
+				if name, err := le.Link.GetName(parentKR, p.s.addrKR); err == nil {
+					childPath := strings.TrimRight(parentPath, "/") + "/" + name
+					p.s.linkPaths[linkID] = childPath
+					eventPath = childPath
+					et = EventCreated
+				}
+			}
+		}
 		if parentPath != "" {
 			p.s.meta.InvalidatePath(parentPath)
 		} else {

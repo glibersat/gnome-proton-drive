@@ -163,7 +163,11 @@ emit_on_monitors (GVfsBackendProton *self,
          (entry->path[plen - 1] == '/' || file_path[plen] == '/'));
 
       if (match)
-        g_vfs_monitor_emit_event (entry->monitor, event_type, file_path, NULL);
+        {
+          g_message ("emit_on_monitors: -> monitor@%s  event=%d  file=%s",
+                     entry->path, event_type, file_path);
+          g_vfs_monitor_emit_event (entry->monitor, event_type, file_path, NULL);
+        }
     }
 }
 
@@ -174,16 +178,25 @@ poll_events_cb (gpointer user_data)
   GVfsBackendProton *self = G_VFS_BACKEND_PROTON (user_data);
   GError *error = NULL;
 
+  g_debug ("poll_events: tick (monitors=%u)", self->monitors->len);
+
   ProtonEvent **events = proton_rpc_get_events (self->rpc, &error);
   if (!events)
     {
       if (error)
         {
-          g_debug ("poll_events: %s", error->message);
+          g_warning ("poll_events: RPC error: %s", error->message);
           g_error_free (error);
         }
       return G_SOURCE_CONTINUE;
     }
+
+  guint n_events = 0;
+  for (ProtonEvent **ev = events; *ev; ev++)
+    n_events++;
+
+  if (n_events > 0)
+    g_message ("poll_events: %u event(s), %u monitor(s)", n_events, self->monitors->len);
 
   for (ProtonEvent **ev = events; *ev; ev++)
     {
@@ -195,6 +208,8 @@ poll_events_cb (gpointer user_data)
       else
         gev = G_FILE_MONITOR_EVENT_CHANGED;
 
+      g_message ("poll_events: dispatch type=%s path=%s",
+                 (*ev)->type, (*ev)->path ? (*ev)->path : "(null)");
       emit_on_monitors (self, gev, (*ev)->path);
     }
 
@@ -220,6 +235,7 @@ register_monitor (GVfsBackendProton    *self,
   g_ptr_array_add (self->monitors, entry);
   g_object_unref (monitor); /* entry holds a weak ref; job holds the strong ref */
 
+  g_message ("register_monitor: path=%s (total=%u)", filename, self->monitors->len);
   g_vfs_job_succeeded (G_VFS_JOB (job));
 }
 
