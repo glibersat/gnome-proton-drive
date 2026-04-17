@@ -233,10 +233,14 @@ proton_rpc_list_dir (ProtonRpc   *rpc,
     {
       JsonObject  *e   = json_array_get_object_element (arr, i);
       ProtonEntry *ent = g_new0 (ProtonEntry, 1);
-      ent->name   = g_strdup (json_object_get_string_member (e, "name"));
-      ent->is_dir = json_object_get_boolean_member (e, "is_dir");
-      ent->size   = json_object_get_int_member (e, "size");
-      ent->mtime  = json_object_get_int_member (e, "mtime");
+      ent->name        = g_strdup (json_object_get_string_member (e, "name"));
+      ent->is_dir      = json_object_get_boolean_member (e, "is_dir");
+      ent->size        = json_object_get_int_member (e, "size");
+      ent->mtime       = json_object_get_int_member (e, "mtime");
+      if (json_object_has_member (e, "link_id"))
+        ent->link_id = g_strdup (json_object_get_string_member (e, "link_id"));
+      if (json_object_has_member (e, "revision_id"))
+        ent->revision_id = g_strdup (json_object_get_string_member (e, "revision_id"));
       entries[i]  = ent;
     }
 
@@ -260,10 +264,14 @@ proton_rpc_stat (ProtonRpc   *rpc,
 
   JsonObject  *e   = json_object_get_object_member (resp, "result");
   ProtonEntry *ent = g_new0 (ProtonEntry, 1);
-  ent->name   = g_strdup (json_object_get_string_member (e, "name"));
-  ent->is_dir = json_object_get_boolean_member (e, "is_dir");
-  ent->size   = json_object_get_int_member (e, "size");
-  ent->mtime  = json_object_get_int_member (e, "mtime");
+  ent->name        = g_strdup (json_object_get_string_member (e, "name"));
+  ent->is_dir      = json_object_get_boolean_member (e, "is_dir");
+  ent->size        = json_object_get_int_member (e, "size");
+  ent->mtime       = json_object_get_int_member (e, "mtime");
+  if (json_object_has_member (e, "link_id"))
+    ent->link_id = g_strdup (json_object_get_string_member (e, "link_id"));
+  if (json_object_has_member (e, "revision_id"))
+    ent->revision_id = g_strdup (json_object_get_string_member (e, "revision_id"));
   return ent;
 }
 
@@ -311,6 +319,8 @@ proton_entry_free (ProtonEntry *entry)
   if (!entry)
     return;
   g_free (entry->name);
+  g_free (entry->link_id);
+  g_free (entry->revision_id);
   g_free (entry);
 }
 

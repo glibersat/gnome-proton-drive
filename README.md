@@ -16,7 +16,8 @@ Nautilus / GTK file choosers
 gvfsd-proton  (C, GVfs backend)
         ↕ Unix socket — line-delimited JSON-RPC
 proton-drive-helper  (Go binary)
-        ├── MetaCache   (in-memory, 30 s TTL)
+        ├── EventPoller (volume events, 30 s poll)
+        ├── MetaCache   (in-memory, event-invalidated)
         ├── BlockCache  (~/.cache/proton-drive/)
         └── ↕ HTTPS + E2E encryption
 Proton Drive API
@@ -28,10 +29,10 @@ calls using [go-proton-api](https://github.com/ProtonMail/go-proton-api).
 appear as a native volume. The backend spawns the helper automatically on
 mount.
 
-Directory listings and file metadata are cached in-process (30 s TTL).
-Decrypted file content is cached on disk under
-`~/.cache/proton-drive/<account>/` so repeated reads and offline access work
-without hitting the network. See `docs/caching.md` for details.
+Directory listings and file metadata are cached in-process, invalidated by
+the event poller when remote changes arrive. Decrypted file content is cached
+on disk under `~/.cache/proton-drive/<account>/` so repeated reads and offline
+access work without hitting the network. See `docs/caching.md` for details.
 
 ## Building
 
@@ -178,7 +179,7 @@ one JSON object terminated by `\n`.
 | List directory | ✅ |
 | Stat file/directory | ✅ |
 | Read file (decrypted) | ✅ |
-| Metadata cache (30 s TTL, offline fallback) | ✅ |
+| Metadata cache (event-invalidated, offline fallback) | ✅ |
 | Block cache (persistent, 2 GiB LRU, offline reads) | ✅ |
 | GVfs C backend (read-only) | ✅ |
 | Delete / trash | ✅ (helper only — not exposed via GVfs yet) |
@@ -186,7 +187,7 @@ one JSON object terminated by `\n`.
 | Move / rename | ⏳ `MoveLink` not yet in go-proton-api |
 | Write file | ⏳ Block upload + revision creation |
 | GNOME volume monitor | 🔲 Not started |
-| Two-way sync / event polling | 🔲 Not started |
+| Event polling (remote → Nautilus) | ✅ Volume-level, anchor-persisted; `HasMoreData` paging pending |
 | Block cache re-encryption | 🔲 Currently stored as plaintext |
 | Pinned offline files | 🔲 Not started |
 | GNOME Online Accounts integration | 🔲 Future (post-M3) |

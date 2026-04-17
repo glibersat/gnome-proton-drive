@@ -102,10 +102,12 @@ type ListDirResult struct {
 type StatParams struct{ Path string `json:"path"` }
 
 type Entry struct {
-	Name  string `json:"name"`
-	IsDir bool   `json:"is_dir"`
-	Size  int64  `json:"size"`
-	MTime int64  `json:"mtime"`
+	Name       string `json:"name"`
+	IsDir      bool   `json:"is_dir"`
+	Size       int64  `json:"size"`
+	MTime      int64  `json:"mtime"`
+	LinkID     string `json:"link_id"`
+	RevisionID string `json:"revision_id,omitempty"` // files only
 }
 
 type ReadParams struct {

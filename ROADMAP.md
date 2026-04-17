@@ -136,28 +136,36 @@ client (see `docs/reference.md`). Three sub-tasks remain blocked on
 Track against `go-proton-api` releases. When unblocked, implement in
 `drive/session.go` and register the handlers in `main.go`.
 
-### B4. Event polling ✅ (partial)
+### B4. Event polling ✅
 
-Polls `/drive/shares/{id}/events/{eventID}` every 30 s via `EventPoller`
+Polls `/drive/volumes/{id}/events/{anchorID}` every 30 s via `EventPoller`
 (`helper/drive/events.go`). The C backend drains the queue every 5 s via
 `GetEvents` RPC and emits `GVfsMonitor` notifications.
 
 **What works:**
-- Anchor fetched at startup; events translated to `DriveEvent{Type, LinkID, Path}`.
+- Volume-level event endpoint used (covers all shares in one poll).
+- Anchor persisted to `~/.cache/proton-drive/<account>/anchor` after each
+  successful batch; resumed on restart so no events are missed.
+- Stale anchor recovered automatically: on empty `EventID` response the poller
+  re-anchors at the current head and requests a full metadata refresh.
 - `MetaCache` and `BlockCache` invalidated immediately on receipt.
-- GVfs monitors triggered: file manager refreshes affected directories.
-- `linkPaths` reverse map ensures parent-directory path is used when the
-  specific changed file has not been visited yet.
+- Diff-based change detection: for `Create` and `UpdateMetadata` events the
+  poller captures the old directory listing from the cache before invalidation,
+  fetches the new listing from the API, and emits precise `CREATED` / `DELETED`
+  events with the child path — which is what Nautilus requires to add/remove
+  entries without a full re-enumeration.
+- Trash detection: when a `UpdateMetadata` event arrives for a known path, the
+  helper fetches the link state; `LinkStateTrashed` and `LinkStateDeleted` both
+  emit `EventDeleted` so Nautilus removes the entry immediately.
+- GVfs monitors triggered with `CREATED` / `DELETED` / `CHANGED` on the
+  specific child path, not just the parent directory.
 
-**Known gaps (cross-referenced from Windows client):**
+**Known gaps:**
 
 | Gap | Impact | Fix |
 |---|---|---|
-| Share-level endpoint only | May miss events not tied to main share | Migrate to volume-level endpoint (`GET /drive/volumes/{id}/events/{id}`) once go-proton-api exposes it |
-| Anchor not persisted | Events missed across helper restarts | Write anchor to `~/.cache/proton-drive/<account>/anchor` after each successful batch |
 | `HasMoreData` not drained immediately | Burst of events takes many 30 s ticks to process | Loop until `HasMoreData == false` before waiting for next tick |
-| Stale anchor not recovered | Poll stalls after anchor becomes invalid | On `InvalidEncryptedIdFormat` (or empty `anchorId` in response), call `GetLatestShareEventID` to re-anchor |
-| `UpdateMetadata` mapped to `EventChanged` | Renames/moves not distinguished | Add `EventMoved` type for future C3 move propagation (B3 dependency) |
+| `UpdateMetadata` not distinguished from `EventChanged` for renames/moves | Renames appear as delete+create instead of move | Add `EventMoved` type for future C3 move propagation (B3 dependency) |
 
 ---
 
@@ -211,8 +219,12 @@ overwrite. Revisit once revision history API is accessible.
 
 **Metadata cache (in-process, Track B) ✅**
 
-- `ListDir` and `Stat` results cached in the helper with a 30 s TTL
-  (`helper/drive/metacache.go`).
+- `ListDir` and `Stat` results cached in the helper (`helper/drive/metacache.go`).
+- Currently TTL-based (30 s); planned replacement with an entry-count LRU — the
+  B4 event poller already calls `InvalidatePath` on every remote change, so the
+  TTL exists only as a fallback for missed events. With volume-level events and
+  anchor persistence, correctness is guaranteed by invalidation rather than expiry;
+  a pure LRU (no TTL) reduces unnecessary API round-trips for hot directories.
 - Stale entries served when the API is unreachable (offline fallback).
 - `InvalidatePath(path)` wired to B4 events.
 - Eliminates redundant API round-trips when Nautilus re-stats files during
@@ -254,7 +266,7 @@ overwrite. Revisit once revision history API is accessible.
 | Milestone | Tracks | Deliverable | Status |
 |---|---|---|---|
 | **M1 — Read-only mount** | A1 + A2 + B1 + C1 + C2 | Proton Drive visible in Nautilus; files openable read-only | In progress |
-| **M2 — Live updates** | B4 + C3 (remote→local) | Nautilus refreshes when remote changes | In progress — basic polling and monitor notifications work; anchor persistence and `HasMoreData` paging pending |
+| **M2 — Live updates** | B4 + C3 (remote→local) | Nautilus refreshes when remote changes | ✅ Core complete — volume-level polling, anchor persistence, diff-based CREATED/DELETED, trash detection all working. `HasMoreData` paging and move/rename distinction pending |
 | **M3 — Full read/write** | B3 + C1 (writes) + C3 | Create, edit, move, delete from Nautilus | Blocked on go-proton-api |
 | **M4 — Settings panel** | A3-a or A3-b | Proton Drive in GNOME Settings → Online Accounts | Not started |
 | **M5 — Cache + offline** | C4 | Fast repeated access; reads served from disk when offline — *read-only tier done; pinning and write-queue pending* | Partial |
@@ -277,7 +289,9 @@ overwrite. Revisit once revision history API is accessible.
    specific commit. Policy needed: periodic manual upgrade or request a
    semver tag from upstream.
 
-5. **Volume vs. share event endpoint:** The Windows client prefers
-   `GET /drive/volumes/{id}/events/{anchorId}` over the share-level endpoint.
-   Volume events include a `ContextShareID` per item, covering multiple shares
-   in one poll. Migrate once go-proton-api exposes the volume event API.
+5. **MetaCache TTL vs. LRU:** The current 30 s TTL is a correctness safety net
+   for missed events. Now that volume-level polling with anchor persistence is
+   in place, event-driven invalidation (`InvalidatePath`) is the primary
+   freshness mechanism. Replace the TTL map with a pure entry-count LRU so hot
+   directories are never unnecessarily re-fetched; the offline stale fallback
+   (`GetListStale` / `GetStatStale`) continues to work unchanged.

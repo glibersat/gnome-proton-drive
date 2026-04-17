@@ -212,11 +212,17 @@ func main() {
 				continue
 			}
 			log.Printf("  entry %q type=%d dir=%v size=%d", name, l.Type, l.Type == proton.LinkTypeFolder, l.Size)
+			var revID string
+			if l.FileProperties != nil {
+				revID = l.FileProperties.ActiveRevision.ID
+			}
 			result.Entries = append(result.Entries, rpc.Entry{
-				Name:  name,
-				IsDir: l.Type == proton.LinkTypeFolder,
-				Size:  l.Size,
-				MTime: l.ModifyTime,
+				Name:       name,
+				IsDir:      l.Type == proton.LinkTypeFolder,
+				Size:       l.Size,
+				MTime:      l.ModifyTime,
+				LinkID:     l.LinkID,
+				RevisionID: revID,
 			})
 		}
 		return result, nil
@@ -238,11 +244,17 @@ func main() {
 		}
 
 		name, _ := link.GetName(parentKR, s.AddrKR())
+		var revID string
+		if link.FileProperties != nil {
+			revID = link.FileProperties.ActiveRevision.ID
+		}
 		return rpc.Entry{
-			Name:  name,
-			IsDir: link.Type == proton.LinkTypeFolder,
-			Size:  link.Size,
-			MTime: link.ModifyTime,
+			Name:       name,
+			IsDir:      link.Type == proton.LinkTypeFolder,
+			Size:       link.Size,
+			MTime:      link.ModifyTime,
+			LinkID:     link.LinkID,
+			RevisionID: revID,
 		}, nil
 	})
 

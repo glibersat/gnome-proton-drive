@@ -78,6 +78,16 @@ fill_file_info (GFileInfo *info, ProtonEntry *e)
   GDateTime *dt = g_date_time_new_from_unix_utc (e->mtime);
   g_file_info_set_modification_date_time (info, dt);
   g_date_time_unref (dt);
+
+  if (e->link_id)
+    g_file_info_set_attribute_string (info, G_FILE_ATTRIBUTE_ID_FILE, e->link_id);
+
+  /* revision_id is the perfect etag: stable while content is unchanged,
+   * updated exactly when a new revision is uploaded. The thumbnail factory
+   * uses this instead of mtime when available, avoiding spurious regeneration
+   * due to timestamp precision. */
+  if (e->revision_id)
+    g_file_info_set_attribute_string (info, G_FILE_ATTRIBUTE_ETAG_VALUE, e->revision_id);
 }
 
 /* ---------- libsecret helpers ---------- */

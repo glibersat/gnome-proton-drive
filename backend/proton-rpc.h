@@ -15,7 +15,9 @@ typedef struct {
   gchar    *name;
   gboolean  is_dir;
   gint64    size;
-  gint64    mtime;   /* unix seconds */
+  gint64    mtime;        /* unix seconds */
+  gchar    *link_id;      /* stable Proton linkID — use as G_FILE_ATTRIBUTE_ID_FILE */
+  gchar    *revision_id;  /* active revision ID for files; NULL for directories */
 } ProtonEntry;
 
 ProtonRpc  *proton_rpc_new          (const gchar  *socket_path,
