@@ -158,7 +158,7 @@ func (p *EventPoller) poll(ctx context.Context, eventID string) string {
 			log.Printf("events: re-anchor failed: %v", err)
 			return eventID
 		}
-		p.s.meta.invalidateAll()
+		p.s.invalidateAll()
 		p.enqueue(DriveEvent{Type: EventChanged, Path: "/"})
 		p.saveAnchor(newID)
 		return newID
@@ -166,7 +166,7 @@ func (p *EventPoller) poll(ctx context.Context, eventID string) string {
 
 	if ev.Refresh {
 		log.Printf("events: server requested full refresh")
-		p.s.meta.invalidateAll()
+		p.s.invalidateAll()
 		p.enqueue(DriveEvent{Type: EventChanged, Path: "/"})
 		p.saveAnchor(ev.EventID)
 		return ev.EventID
@@ -219,9 +219,9 @@ func (p *EventPoller) handle(le proton.LinkEvent) {
 
 	switch le.EventType {
 	case proton.LinkEventDelete:
-		p.s.meta.InvalidatePath(path)
+		p.s.InvalidatePath(path)
 		if path == "" {
-			p.s.meta.invalidateLinkID(parentID)
+			p.s.invalidateLinkID(parentID)
 		}
 		p.s.blocks.InvalidateLink(linkID)
 
@@ -240,9 +240,9 @@ func (p *EventPoller) handle(le proton.LinkEvent) {
 		// Capture old parent listing BEFORE invalidation for the diff fallback.
 		oldLinks, _, hasOld := p.s.meta.GetListStale(parentPath)
 		if parentPath != "" {
-			p.s.meta.InvalidatePath(parentPath)
+			p.s.InvalidatePath(parentPath)
 		} else {
-			p.s.meta.invalidateLinkID(parentID)
+			p.s.invalidateLinkID(parentID)
 		}
 
 		// Fast path: decrypt child name directly from event payload.
@@ -295,12 +295,12 @@ func (p *EventPoller) handle(le proton.LinkEvent) {
 		log.Printf("events: default: path=%q hasOld=%v hasKR=%v parentPath=%q hasOldParent=%v hasParentKR=%v",
 			path, hasOld, hasKR, parentPath, hasOldParent, hasParentKR)
 
-		p.s.meta.InvalidatePath(path)
+		p.s.InvalidatePath(path)
 		if parentPath != "" && parentPath != path {
-			p.s.meta.InvalidatePath(parentPath)
+			p.s.InvalidatePath(parentPath)
 		}
 		if path == "" {
-			p.s.meta.invalidateLinkID(parentID)
+			p.s.invalidateLinkID(parentID)
 		}
 		p.s.blocks.InvalidateLink(linkID)
 

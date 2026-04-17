@@ -33,8 +33,9 @@ type Session struct {
 	account  string                     // email address — scopes the block cache directory
 	addrKR   *crypto.KeyRing            // primary address keyring
 	shareKR  *crypto.KeyRing            // share keyring (unlocked with addrKR)
-	nodeKRs  map[string]*crypto.KeyRing // linkID → decrypted node keyring (cache)
-	linkPaths map[string]string         // linkID → absolute path (reverse map for event resolution)
+	nodeKRs   map[string]*crypto.KeyRing // linkID → decrypted node keyring (cache)
+	linkPaths map[string]string          // linkID → absolute path (reverse map for event resolution)
+	pathLinks map[string]string          // absolute path → linkID (forward map for resolvePath short-circuit)
 	meta     *MetaCache                 // short-lived metadata cache
 	blocks   *BlockCache                // persistent block cache (nil if unavailable)
 	poller   *EventPoller               // background share-event poller
@@ -176,6 +177,7 @@ func newSession(c *proton.Client, shareID, volumeID, rootID, account string, add
 		addrKR:    addrKR,
 		nodeKRs:   make(map[string]*crypto.KeyRing),
 		linkPaths: make(map[string]string),
+		pathLinks: make(map[string]string),
 		meta:      NewMetaCache(0),
 	}
 	base, err := blockCacheBase(account)
@@ -455,9 +457,19 @@ func (s *Session) Delete(ctx context.Context, p string, trash bool) error {
 // --- internal helpers ---
 
 func (s *Session) resolvePath(ctx context.Context, p string) (string, *crypto.KeyRing, error) {
+	p = path.Clean("/" + p)
 	parts := splitPath(p)
 	linkID := s.rootID
 	currentPath := "/"
+
+	// Fast path: full path already resolved.
+	if id, ok := s.pathLinks[p]; ok {
+		if kr, ok := s.nodeKRs[id]; ok {
+			log.Printf("path cache hit  %s", p)
+			return id, kr, nil
+		}
+	}
+	log.Printf("path cache miss %s", p)
 
 	// Seed the reverse map for the root.
 	s.linkPaths[linkID] = "/"
@@ -466,6 +478,7 @@ func (s *Session) resolvePath(ctx context.Context, p string) (string, *crypto.Ke
 	if err != nil {
 		return "", nil, err
 	}
+	s.pathLinks["/"] = s.rootID
 
 	for _, part := range parts {
 		children, err := s.client.ListChildren(ctx, s.shareID, linkID, false)
@@ -499,6 +512,7 @@ func (s *Session) resolvePath(ctx context.Context, p string) (string, *crypto.Ke
 				currentPath = currentPath + "/" + part
 			}
 			s.linkPaths[linkID] = currentPath
+			s.pathLinks[currentPath] = linkID
 			break
 		}
 
@@ -508,6 +522,36 @@ func (s *Session) resolvePath(ctx context.Context, p string) (string, *crypto.Ke
 	}
 
 	return linkID, kr, nil
+}
+
+// InvalidatePath clears all cached state for p: MetaCache entries, the
+// path→linkID forward map entry, and all descendant forward map entries.
+// This is the single call site used by the event poller (events.go) so that
+// every cache layer stays consistent.
+func (s *Session) InvalidatePath(p string) {
+	s.meta.InvalidatePath(p)
+	delete(s.pathLinks, p)
+	prefix := p + "/"
+	for cached := range s.pathLinks {
+		if strings.HasPrefix(cached, prefix) {
+			delete(s.pathLinks, cached)
+		}
+	}
+}
+
+// invalidateLinkID resolves the path for linkID via linkPaths, then delegates
+// to InvalidatePath.
+func (s *Session) invalidateLinkID(linkID string) {
+	s.meta.invalidateLinkID(linkID)
+	if p, ok := s.linkPaths[linkID]; ok {
+		delete(s.pathLinks, p)
+	}
+}
+
+// invalidateAll clears all MetaCache entries and the entire path→linkID map.
+func (s *Session) invalidateAll() {
+	s.meta.invalidateAll()
+	s.pathLinks = make(map[string]string)
 }
 
 func (s *Session) parentKRFor(ctx context.Context, p string) (*crypto.KeyRing, error) {
