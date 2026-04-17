@@ -151,6 +151,15 @@ func (p *EventPoller) handle(le proton.LinkEvent) {
 	path := p.s.linkPath(linkID)
 	parentPath := p.s.linkPath(parentID)
 
+	// eventPath is the most specific path the C backend can act on.
+	// For creates the new file's path is unknown; use the parent directory so
+	// the C backend can signal the right directory monitor.
+	// For deletes/updates fall back to parentPath when the file is unknown.
+	eventPath := path
+	if eventPath == "" {
+		eventPath = parentPath
+	}
+
 	var et EventType
 	switch le.EventType {
 	case proton.LinkEventDelete:
@@ -160,9 +169,15 @@ func (p *EventPoller) handle(le proton.LinkEvent) {
 			p.s.meta.invalidateLinkID(parentID)
 		}
 		p.s.blocks.InvalidateLink(linkID)
+		if eventPath == path {
+			break // known path: emit DELETED for the file itself
+		}
+		// Unknown path: fall through to CHANGED for the parent directory.
+		et = EventChanged
 	case proton.LinkEventCreate:
-		et = EventCreated
-		// Parent directory listing is now stale.
+		// The new file's path is always unknown at event time; use the parent
+		// directory path and emit CHANGED so the C backend re-enumerates it.
+		et = EventChanged
 		if parentPath != "" {
 			p.s.meta.InvalidatePath(parentPath)
 		} else {
@@ -177,8 +192,8 @@ func (p *EventPoller) handle(le proton.LinkEvent) {
 		p.s.blocks.InvalidateLink(linkID)
 	}
 
-	log.Printf("events: %s linkID=%s path=%q", et, linkID, path)
-	p.enqueue(DriveEvent{Type: et, LinkID: linkID, Path: path})
+	log.Printf("events: %s linkID=%s path=%q", et, linkID, eventPath)
+	p.enqueue(DriveEvent{Type: et, LinkID: linkID, Path: eventPath})
 }
 
 func (p *EventPoller) enqueue(ev DriveEvent) {
