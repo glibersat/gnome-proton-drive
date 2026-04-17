@@ -125,6 +125,22 @@ type WriteParams struct {
 	Truncate bool   `json:"truncate"`
 }
 
+// GetEventsResult is returned by GetEvents.  Events is nil (not an empty
+// array) when nothing is pending, so the C backend can distinguish "no events"
+// from "events array present but empty".
+type GetEventsResult struct {
+	Events []Event `json:"events"`
+}
+
+// Event is a single remote-change notification delivered to the C backend.
+// Path is the absolute POSIX path; it may be empty when the changed link was
+// never visited in the current session.
+type Event struct {
+	Type   string `json:"type"`    // "changed" | "deleted" | "created"
+	LinkID string `json:"link_id"`
+	Path   string `json:"path,omitempty"`
+}
+
 type MkdirParams struct{ Path string `json:"path"` }
 
 type DeleteParams struct {

@@ -21,19 +21,22 @@ import (
 // root of the user's main share. Crypto and HTTP work is delegated to
 // go-proton-api; this file only resolves POSIX paths to LinkIDs.
 //
-// Each Session owns a MetaCache (in-memory, TTL-based) and a BlockCache
-// (persistent on-disk).  See metacache.go and blockcache.go for details on
-// the caching architecture and the B4 invalidation hooks.
+// Each Session owns a MetaCache (in-memory, TTL-based), a BlockCache
+// (persistent on-disk), and an EventPoller that polls the share event stream
+// and invalidates stale cache entries as changes arrive.
+// See metacache.go, blockcache.go, and events.go for details.
 type Session struct {
 	client  *proton.Client
 	shareID string
 	rootID  string
-	account string                    // email address — scopes the block cache directory
-	addrKR  *crypto.KeyRing           // primary address keyring
-	shareKR *crypto.KeyRing           // share keyring (unlocked with addrKR)
+	account string                     // email address — scopes the block cache directory
+	addrKR  *crypto.KeyRing            // primary address keyring
+	shareKR *crypto.KeyRing            // share keyring (unlocked with addrKR)
 	nodeKRs map[string]*crypto.KeyRing // linkID → decrypted node keyring (cache)
-	meta    *MetaCache                // short-lived metadata cache
-	blocks  *BlockCache               // persistent block cache (nil if unavailable)
+	linkPaths map[string]string        // linkID → absolute path (reverse map for event resolution)
+	meta    *MetaCache                 // short-lived metadata cache
+	blocks  *BlockCache                // persistent block cache (nil if unavailable)
+	poller  *EventPoller               // background share-event poller
 }
 
 // HVRequiredError is returned by NewSession when Proton requires a CAPTCHA.
@@ -164,13 +167,14 @@ func ResumeSession(ctx context.Context, mgr *proton.Manager, creds SessionCreden
 // persistent block cache.
 func newSession(c *proton.Client, shareID, rootID, account string, addrKR *crypto.KeyRing) *Session {
 	s := &Session{
-		client:  c,
-		shareID: shareID,
-		rootID:  rootID,
-		account: account,
-		addrKR:  addrKR,
-		nodeKRs: make(map[string]*crypto.KeyRing),
-		meta:    NewMetaCache(0),
+		client:    c,
+		shareID:   shareID,
+		rootID:    rootID,
+		account:   account,
+		addrKR:    addrKR,
+		nodeKRs:   make(map[string]*crypto.KeyRing),
+		linkPaths: make(map[string]string),
+		meta:      NewMetaCache(0),
 	}
 	base, err := blockCacheBase(account)
 	if err != nil {
@@ -186,6 +190,15 @@ func newSession(c *proton.Client, shareID, rootID, account string, addrKR *crypt
 	return s
 }
 
+// StartPoller launches the background share-event poller.  It must be called
+// after the session is fully initialised (i.e. after newSession returns) so
+// that the session context is ready for API calls.  Separated from newSession
+// so that callers can hold a reference to the session before polling begins.
+func (s *Session) StartPoller(ctx context.Context) {
+	s.poller = newEventPoller(s, 0)
+	s.poller.Start(ctx)
+}
+
 // blockCacheBase returns the account-scoped base directory for the block cache.
 // The account email is URL-path-escaped so "@" becomes "%40" — safe for all
 // filesystems while remaining human-readable.
@@ -198,7 +211,26 @@ func blockCacheBase(account string) (string, error) {
 }
 
 func (s *Session) Close(ctx context.Context) error {
+	if s.poller != nil {
+		s.poller.Stop()
+	}
 	return s.client.AuthDelete(ctx)
+}
+
+// DrainEvents returns all events queued by the poller since the last call and
+// resets the queue.  Returns nil when nothing is pending or the poller is not
+// running.  This is the backing implementation of the GetEvents RPC method.
+func (s *Session) DrainEvents() []DriveEvent {
+	if s.poller == nil {
+		return nil
+	}
+	return s.poller.Drain()
+}
+
+// linkPath looks up the absolute path for a linkID in the reverse map.
+// Returns an empty string if the link has not been visited in this session.
+func (s *Session) linkPath(linkID string) string {
+	return s.linkPaths[linkID]
 }
 
 func (s *Session) AddrKR() *crypto.KeyRing { return s.addrKR }
@@ -428,6 +460,10 @@ func (s *Session) Delete(ctx context.Context, p string, trash bool) error {
 func (s *Session) resolvePath(ctx context.Context, p string) (string, *crypto.KeyRing, error) {
 	parts := splitPath(p)
 	linkID := s.rootID
+	currentPath := "/"
+
+	// Seed the reverse map for the root.
+	s.linkPaths[linkID] = "/"
 
 	kr, err := s.rootNodeKeyRing(ctx)
 	if err != nil {
@@ -458,6 +494,13 @@ func (s *Session) resolvePath(ctx context.Context, p string) (string, *crypto.Ke
 			linkID = child.LinkID
 			kr = childKR
 			found = true
+
+			if currentPath == "/" {
+				currentPath = "/" + part
+			} else {
+				currentPath = currentPath + "/" + part
+			}
+			s.linkPaths[linkID] = currentPath
 			break
 		}
 

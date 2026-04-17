@@ -313,3 +313,50 @@ proton_entry_free (ProtonEntry *entry)
   g_free (entry->name);
   g_free (entry);
 }
+
+ProtonEvent **
+proton_rpc_get_events (ProtonRpc *rpc, GError **error)
+{
+  g_autoptr(JsonObject) resp = call (rpc, "GetEvents", NULL, error);
+  if (!resp)
+    return NULL;
+
+  JsonObject *result = json_object_get_object_member (resp, "result");
+  JsonArray  *arr    = result ? json_object_get_array_member (result, "events") : NULL;
+  guint       n      = arr ? json_array_get_length (arr) : 0;
+
+  ProtonEvent **events = g_new0 (ProtonEvent *, n + 1); /* NULL-terminated */
+  for (guint i = 0; i < n; i++)
+    {
+      JsonObject  *ev = json_array_get_object_element (arr, i);
+      ProtonEvent *e  = g_new0 (ProtonEvent, 1);
+      e->type    = g_strdup (json_object_get_string_member (ev, "type"));
+      e->link_id = g_strdup (json_object_get_string_member (ev, "link_id"));
+      /* path is omitempty — may be absent */
+      if (json_object_has_member (ev, "path"))
+        e->path = g_strdup (json_object_get_string_member (ev, "path"));
+      events[i] = e;
+    }
+  return events;
+}
+
+void
+proton_event_free (ProtonEvent *event)
+{
+  if (!event)
+    return;
+  g_free (event->type);
+  g_free (event->link_id);
+  g_free (event->path);
+  g_free (event);
+}
+
+void
+proton_events_free (ProtonEvent **events)
+{
+  if (!events)
+    return;
+  for (ProtonEvent **e = events; *e; e++)
+    proton_event_free (*e);
+  g_free (events);
+}

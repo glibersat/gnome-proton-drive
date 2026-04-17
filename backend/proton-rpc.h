@@ -67,4 +67,20 @@ gssize        proton_rpc_read_file  (ProtonRpc    *rpc,
 
 void          proton_entry_free     (ProtonEntry  *entry);
 
+/* A single remote-change event returned by GetEvents.
+ * path may be NULL when the changed link was not yet visited in this session. */
+typedef struct {
+  gchar *type;    /* "changed" | "deleted" | "created" */
+  gchar *link_id;
+  gchar *path;    /* absolute POSIX path, or NULL */
+} ProtonEvent;
+
+/* Drain the helper's event queue.  Returns a NULL-terminated array of
+ * ProtonEvent* owned by the caller.  Never blocks — returns an empty array
+ * (length 0, first element NULL) when nothing is pending.
+ * Free with proton_events_free(). */
+ProtonEvent **proton_rpc_get_events (ProtonRpc *rpc, GError **error);
+void          proton_event_free     (ProtonEvent *event);
+void          proton_events_free    (ProtonEvent **events);
+
 G_END_DECLS

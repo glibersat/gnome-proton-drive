@@ -67,6 +67,7 @@ func main() {
 			return nil, &rpc.RPCError{Code: rpc.ErrAuthFailed, Message: err.Error()}
 		}
 		session = s
+		session.StartPoller(ctx)
 		return rpc.AuthResult{
 			UID:              creds.UID,
 			RefreshToken:     creds.RefreshToken,
@@ -105,6 +106,7 @@ func main() {
 			return nil, &rpc.RPCError{Code: rpc.ErrAuthFailed, Message: err.Error()}
 		}
 		session = s
+		session.StartPoller(ctx)
 		return rpc.AuthResult{
 			UID:              creds.UID,
 			RefreshToken:     creds.RefreshToken,
@@ -154,11 +156,32 @@ func main() {
 			return nil, &rpc.RPCError{Code: rpc.ErrAuthFailed, Message: err.Error()}
 		}
 		session = s
+		session.StartPoller(ctx)
 		return rpc.AuthResult{
 			UID:              creds.UID,
 			RefreshToken:     creds.RefreshToken,
 			SaltedPassphrase: creds.SaltedPassphrase,
 		}, nil
+	})
+
+	// GetEvents drains the event queue accumulated by the background poller
+	// since the last call.  Returns an empty list when nothing is pending.
+	// The C backend calls this every 5 s to drive g_file_monitor_emit_event().
+	srv.Register("GetEvents", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		s, err := requireSession()
+		if err != nil {
+			return nil, err
+		}
+		drained := s.DrainEvents()
+		events := make([]rpc.Event, len(drained))
+		for i, e := range drained {
+			events[i] = rpc.Event{
+				Type:   string(e.Type),
+				LinkID: e.LinkID,
+				Path:   e.Path,
+			}
+		}
+		return rpc.GetEventsResult{Events: events}, nil
 	})
 
 	srv.Register("ListDir", func(ctx context.Context, raw json.RawMessage) (any, error) {
