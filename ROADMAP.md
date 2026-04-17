@@ -192,27 +192,38 @@ A `gvfsd-proton-volume-monitor` daemon that makes the drive appear in Nautilus:
 Every file read currently fetches all blocks from the API. Two complementary
 layers are needed:
 
-**Metadata cache (in-process, Track B)**
+**Metadata cache (in-process, Track B) ✅**
 
-- Cache `ListDir` and `Stat` results in the helper for a short TTL (e.g. 30 s).
-- Invalidate on write ops and on events received from B4.
-- Eliminates redundant API round-trips when Nautilus re-states files during
-  enumeration or drag-and-drop.
+- `ListDir` and `Stat` results cached in the helper with a 30 s TTL
+  (`helper/drive/metacache.go`).
+- Stale entries served when the API is unreachable (offline fallback).
+- `InvalidatePath(path)` stub wired — B4 integration is a one-liner.
+- Eliminates redundant API round-trips when Nautilus re-stats files during
+  enumeration and drag-and-drop.
 
-**Block cache / offline store (persistent, Track B+C)**
+**Block cache / offline store (persistent, read-only tier) ✅ (partial)**
 
-- Store decrypted (or re-encrypted-for-local-use) file blocks on disk under
-  `~/.cache/proton-drive/<account>/<linkID>/`.
-- Two tiers:
-  - *Read-through:* blocks fetched on demand and kept for a configurable TTL.
-  - *Pinned:* user-marked files/folders synced proactively and kept available
-    without network access.
-- Cache invalidation driven by B4 events; stale entries evicted by a size/age
-  policy (default: 2 GB LRU).
-- **Offline mode:** when the helper cannot reach the API, serve reads from cache
-  and queue writes locally. Flush the write queue and merge on reconnect.
-- Conflict detection on reconnect: compare local mtime against the revision
-  seen in the event stream; flag conflicts rather than silently overwriting.
+- Decrypted file content stored on disk under
+  `~/.cache/proton-drive/<account>/blocks/<linkID>/<revisionID>`
+  (`helper/drive/blockcache.go`).
+- *Read-through* tier implemented: blocks fetched on demand, cached on first
+  read, served from disk on subsequent reads.
+- 2 GiB LRU eviction; mtime updated on each cache hit for accurate ordering.
+- **Offline reads** work for previously-opened files (`rpc.ErrOffline = -32005`
+  returned to the C backend when offline with no cached data).
+- `InvalidateLink(linkID)` stub wired — B4 integration is a one-liner.
+- Cache hit/miss/stale events logged by the helper.
+
+**Remaining for full C4:**
+
+- *Pinned tier:* user-marked files synced proactively and available without
+  network access.
+- *Write queue:* queue local writes offline and flush on reconnect (blocked on
+  B3 write operations).
+- *Conflict detection* on reconnect: compare local mtime against revision seen
+  in event stream.
+- *Block re-encryption* for local storage (currently stored as plaintext —
+  relies on OS full-disk encryption).
 
 **Open questions for C4:**
 - Re-encrypt blocks for local storage (avoids storing plaintext on disk) or
@@ -230,7 +241,7 @@ layers are needed:
 | **M2 — Live updates** | B4 + C3 (remote→local) | Nautilus refreshes when remote changes |
 | **M3 — Full read/write** | B3 + C1 (writes) + C3 | Create, edit, move, delete from Nautilus |
 | **M4 — Settings panel** | A3-a or A3-b | Proton Drive in GNOME Settings → Online Accounts |
-| **M5 — Cache + offline** | C4 | Fast repeated access; reads served from disk when offline |
+| **M5 — Cache + offline** | C4 | Fast repeated access; reads served from disk when offline — *read-only tier done; pinning and write-queue pending* |
 
 ---
 
