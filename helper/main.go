@@ -15,15 +15,20 @@ import (
 	"github.com/glibersat/gnome-proton/helper/rpc"
 )
 
-// linkToEntry converts a proton.Link to an rpc.Entry. For files, mtime is the
-// revision creation time — stable across metadata changes, changing only when
-// content changes. For directories, link.ModifyTime is used as-is.
+// linkToEntry converts a proton.Link to an rpc.Entry.
+// mtime priority: ActiveRevision.CreateTime (stable, content-keyed) →
+// link.CreateTime (stable, set once at upload) → link.ModifyTime (last resort).
 func linkToEntry(l proton.Link, name string) rpc.Entry {
 	mtime := l.ModifyTime
+	if l.CreateTime != 0 {
+		mtime = l.CreateTime
+	}
 	var revID string
 	if l.FileProperties != nil {
 		revID = l.FileProperties.ActiveRevision.ID
-		mtime = l.FileProperties.ActiveRevision.CreateTime
+		if l.FileProperties.ActiveRevision.CreateTime != 0 {
+			mtime = l.FileProperties.ActiveRevision.CreateTime
+		}
 	}
 	return rpc.Entry{
 		Name:       name,
