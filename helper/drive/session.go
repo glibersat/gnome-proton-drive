@@ -322,13 +322,8 @@ func (s *Session) statUncached(ctx context.Context, p string) (proton.Link, *cry
 	}
 
 	parentPath := path.Dir(p)
-	parentID, _, err := s.resolvePath(ctx, parentPath)
-	if err != nil {
-		return proton.Link{}, nil, err
-	}
-
 	name := path.Base(p)
-	children, err := s.client.ListChildren(ctx, s.shareID, parentID, false)
+	children, _, err := s.ListChildren(ctx, parentPath)
 	if err != nil {
 		return proton.Link{}, nil, err
 	}
@@ -477,6 +472,7 @@ func (s *Session) resolvePath(ctx context.Context, p string) (string, *crypto.Ke
 		if err != nil {
 			return "", nil, err
 		}
+		s.meta.SetList(currentPath, children, kr)
 
 		found := false
 		for _, child := range children {

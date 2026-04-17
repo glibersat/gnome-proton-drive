@@ -115,6 +115,28 @@ Tests must be written alongside every piece of code — never deferred.
 Current state: `resolvePath` walks the tree on every call. Add an in-memory
 `linkID` cache keyed by path, invalidated by Drive events (see B4).
 
+**Directory listing latency — identified optimisation queue (priority order):**
+
+1. **Warm MetaCache during `resolvePath` traversal** *(low effort, high impact)* —
+   `resolvePath` fetches children of every intermediate directory via the raw
+   `s.client.ListChildren` call, bypassing `MetaCache`. Storing those results
+   with `meta.SetList` turns every path walk into a free cache warm-up: a
+   subsequent `ListChildren` to any intermediate dir becomes an instant hit.
+   Fix `statUncached` (line 331) the same way — route through `s.ListChildren`
+   instead of `s.client.ListChildren`.
+
+2. **Cache path→linkID in `resolvePath`** *(medium effort, highest steady-state gain)* —
+   `resolvePath` re-walks the full path from root on every call even when the
+   path has already been resolved. Add a forward map `path → linkID` (the
+   reverse of the existing `linkPaths`) to `MetaCache` or `Session` so that
+   `resolvePath` can short-circuit entirely for already-resolved paths,
+   eliminating the tree walk and all per-segment crypto overhead.
+
+3. **Parallel name decryption in `resolvePath`** *(medium effort, helps wide dirs)* —
+   At each path segment all child names are decrypted serially to find the
+   match. Fanning out `GetName` into goroutines (first-match via channel) cuts
+   crypto time proportionally to directory width.
+
 ### B2. Streaming block reads
 
 Current `ReadFile` buffers the entire file before applying offset/length.
