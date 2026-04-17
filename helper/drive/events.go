@@ -10,6 +10,7 @@ import (
 	"time"
 
 	proton "github.com/ProtonMail/go-proton-api"
+	"github.com/ProtonMail/gopenpgp/v2/crypto"
 )
 
 const (
@@ -211,65 +212,164 @@ func (p *EventPoller) handle(le proton.LinkEvent) {
 	linkID := le.Link.LinkID
 	parentID := le.Link.ParentLinkID
 
-	// Resolve paths from the session's reverse map before invalidating.
+	log.Printf("events: raw eventType=%d linkID=%s parentID=%s", le.EventType, linkID, parentID)
+
 	path := p.s.linkPath(linkID)
 	parentPath := p.s.linkPath(parentID)
 
-	// eventPath is the most specific path the C backend can act on.
-	// For creates the new file's path is unknown; use the parent directory so
-	// the C backend can signal the right directory monitor.
-	// For deletes/updates fall back to parentPath when the file is unknown.
-	eventPath := path
-	if eventPath == "" {
-		eventPath = parentPath
-	}
-
-	var et EventType
 	switch le.EventType {
 	case proton.LinkEventDelete:
-		et = EventDeleted
 		p.s.meta.InvalidatePath(path)
 		if path == "" {
 			p.s.meta.invalidateLinkID(parentID)
 		}
 		p.s.blocks.InvalidateLink(linkID)
-		if eventPath == path {
-			break // known path: emit DELETED for the file itself
-		}
-		// Unknown path: fall through to CHANGED for the parent directory.
-		et = EventChanged
-	case proton.LinkEventCreate:
-		// Try to decrypt the new link's name from the event payload using the
-		// parent's cached NodeKeyRing. If successful, emit CREATED with the full
-		// child path so Nautilus adds the entry immediately. If the parent keyring
-		// is not yet cached, fall back to CHANGED on the parent directory.
-		et = EventChanged
-		if parentPath != "" {
-			if parentKR, ok := p.s.nodeKRs[parentID]; ok {
-				if name, err := le.Link.GetName(parentKR, p.s.addrKR); err == nil {
-					childPath := strings.TrimRight(parentPath, "/") + "/" + name
-					p.s.linkPaths[linkID] = childPath
-					eventPath = childPath
-					et = EventCreated
-				}
+
+		if path != "" {
+			log.Printf("events: deleted linkID=%s path=%q", linkID, path)
+			p.enqueue(DriveEvent{Type: EventDeleted, LinkID: linkID, Path: path})
+		} else {
+			// Path unknown — signal the parent directory so Nautilus re-enumerates.
+			log.Printf("events: delete: path unknown linkID=%s; changed parent %q", linkID, parentPath)
+			if parentPath != "" {
+				p.enqueue(DriveEvent{Type: EventChanged, LinkID: linkID, Path: parentPath})
 			}
 		}
+
+	case proton.LinkEventCreate:
+		// Capture old parent listing BEFORE invalidation for the diff fallback.
+		oldLinks, _, hasOld := p.s.meta.GetListStale(parentPath)
 		if parentPath != "" {
 			p.s.meta.InvalidatePath(parentPath)
 		} else {
 			p.s.meta.invalidateLinkID(parentID)
 		}
+
+		// Fast path: decrypt child name directly from event payload.
+		if parentPath != "" {
+			if parentKR, ok := p.s.nodeKRs[parentID]; ok {
+				name, err := le.Link.GetName(parentKR, p.s.addrKR)
+				if err != nil {
+					// Volume events may omit the encrypted Name; fetch the full link.
+					if fullLink, ferr := p.s.client.GetLink(context.Background(), p.s.shareID, linkID); ferr == nil {
+						name, err = fullLink.GetName(parentKR, p.s.addrKR)
+					}
+				}
+				if err == nil && name != "" {
+					childPath := strings.TrimRight(parentPath, "/") + "/" + name
+					p.s.linkPaths[linkID] = childPath
+					log.Printf("events: created linkID=%s path=%q", linkID, childPath)
+					p.enqueue(DriveEvent{Type: EventCreated, LinkID: linkID, Path: childPath})
+					return
+				}
+				log.Printf("events: create: name resolve failed linkID=%s: %v", linkID, err)
+			} else {
+				log.Printf("events: create: parent KR not cached parentID=%s", parentID)
+			}
+		}
+
+		// Diff fallback: re-list the parent and emit CREATED for the new entry.
+		if parentPath != "" && hasOld {
+			if parentKR, ok := p.s.nodeKRs[parentID]; ok {
+				if p.diffAndEmit(context.Background(), parentPath, parentID, parentKR, oldLinks) {
+					return
+				}
+			}
+		}
+
+		// Last resort: tell Nautilus the parent directory changed.
+		if parentPath != "" {
+			log.Printf("events: create: fallback changed %q", parentPath)
+			p.enqueue(DriveEvent{Type: EventChanged, LinkID: linkID, Path: parentPath})
+		}
+
 	default: // LinkEventUpdate, LinkEventUpdateMetadata
-		et = EventChanged
+		// Capture old listing BEFORE invalidation so we can diff.
+		oldLinks, _, hasOld := p.s.meta.GetListStale(path)
+
 		p.s.meta.InvalidatePath(path)
 		if path == "" {
 			p.s.meta.invalidateLinkID(parentID)
 		}
 		p.s.blocks.InvalidateLink(linkID)
+
+		// Diff-based detection: when a directory's metadata changes, something
+		// in it was added, removed, or renamed. Re-list and emit specific events.
+		if path != "" && hasOld {
+			if dirKR, ok := p.s.nodeKRs[linkID]; ok {
+				if p.diffAndEmit(context.Background(), path, linkID, dirKR, oldLinks) {
+					return
+				}
+			}
+		}
+
+		// Fallback: emit a CHANGED for the best-known path.
+		eventPath := path
+		if eventPath == "" {
+			eventPath = parentPath
+		}
+		if eventPath != "" {
+			log.Printf("events: changed linkID=%s path=%q", linkID, eventPath)
+			p.enqueue(DriveEvent{Type: EventChanged, LinkID: linkID, Path: eventPath})
+		}
+	}
+}
+
+// diffAndEmit compares oldLinks against the current API listing for dirPath.
+// For each entry that appeared it emits EventCreated; for each that disappeared
+// it emits EventDeleted. linkPaths is updated for newly discovered entries and
+// the meta cache is refreshed with the new listing.
+// Returns true when the diff ran successfully (no API error), even if there are
+// no differences (prevents a spurious generic EventChanged from being queued).
+func (p *EventPoller) diffAndEmit(ctx context.Context, dirPath, dirLinkID string, dirKR *crypto.KeyRing, oldLinks []proton.Link) bool {
+	// Decrypt old names → name→linkID map.
+	oldNames := make(map[string]string)
+	for _, l := range oldLinks {
+		name, err := l.GetName(dirKR, p.s.addrKR)
+		if err == nil {
+			oldNames[name] = l.LinkID
+		}
 	}
 
-	log.Printf("events: %s linkID=%s path=%q", et, linkID, eventPath)
-	p.enqueue(DriveEvent{Type: et, LinkID: linkID, Path: eventPath})
+	// Fetch current children from the API (cache was already invalidated).
+	newLinks, err := p.s.client.ListChildren(ctx, p.s.shareID, dirLinkID, false)
+	if err != nil {
+		log.Printf("events: diff: list failed for %s: %v", dirPath, err)
+		return false
+	}
+
+	// Decrypt new names, update linkPaths and meta cache.
+	newNames := make(map[string]string)
+	for _, l := range newLinks {
+		name, err := l.GetName(dirKR, p.s.addrKR)
+		if err != nil {
+			continue
+		}
+		childPath := strings.TrimRight(dirPath, "/") + "/" + name
+		p.s.linkPaths[l.LinkID] = childPath
+		newNames[name] = l.LinkID
+	}
+	p.s.meta.SetList(dirPath, newLinks, dirKR)
+
+	// Emit CREATED for entries that appeared.
+	for name, lid := range newNames {
+		if _, existed := oldNames[name]; !existed {
+			childPath := strings.TrimRight(dirPath, "/") + "/" + name
+			log.Printf("events: diff created %s linkID=%s", childPath, lid)
+			p.enqueue(DriveEvent{Type: EventCreated, LinkID: lid, Path: childPath})
+		}
+	}
+
+	// Emit DELETED for entries that disappeared.
+	for name, lid := range oldNames {
+		if _, stillExists := newNames[name]; !stillExists {
+			childPath := strings.TrimRight(dirPath, "/") + "/" + name
+			log.Printf("events: diff deleted %s linkID=%s", childPath, lid)
+			p.enqueue(DriveEvent{Type: EventDeleted, LinkID: lid, Path: childPath})
+		}
+	}
+
+	return true
 }
 
 func (p *EventPoller) enqueue(ev DriveEvent) {
