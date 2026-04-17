@@ -1,4 +1,4 @@
-# gnome-proton
+# Gnome Proton Drive
 
 > **Alpha — read-only.** This project is in early development. Only browsing
 > and opening files is supported; no writes, moves, or deletes are exposed to
