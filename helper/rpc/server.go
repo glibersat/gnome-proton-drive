@@ -78,3 +78,7 @@ func NotFound(msg string) *RPCError {
 func NotAuth() *RPCError {
 	return &RPCError{Code: ErrNotAuthed, Message: "not authenticated"}
 }
+
+func Offline(msg string) *RPCError {
+	return &RPCError{Code: ErrOffline, Message: msg}
+}
