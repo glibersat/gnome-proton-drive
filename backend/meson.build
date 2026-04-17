@@ -93,7 +93,14 @@ configure_file(
 )
 
 # Restart the GVfs daemon after install so it picks up the new backend.
-meson.add_install_script('sh', '-c',
-  'gvfsd --replace &')
+# gvfsd is not guaranteed to be in PATH; search common locations.
+gvfsd_prog = find_program('gvfsd',
+  dirs: [gvfs_lib_dir, '/usr/libexec', '/usr/lib/gvfs'],
+  required: false)
+if gvfsd_prog.found()
+  meson.add_install_script('sh', '-c', gvfsd_prog.full_path() + ' --replace &')
+else
+  warning('gvfsd not found in common locations; post-install daemon restart skipped')
+endif
 
 subdir('tests')
