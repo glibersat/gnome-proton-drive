@@ -29,6 +29,7 @@ const (
 	ErrAuthFailed = -32002
 	ErrNotAuthed  = -32003
 	ErrHVRequired = -32004 // human verification (CAPTCHA) needed
+	ErrOffline    = -32005 // network unreachable and no cached data available
 )
 
 // HVDetails is embedded in RPCError.Details when Code == ErrHVRequired.
@@ -56,19 +57,32 @@ type AuthResult struct {
 }
 
 // ResumeParams allows restoring a session from stored credentials without
-// re-doing SRP.
+// re-doing SRP. Username is optional but, when provided, scopes the on-disk
+// block cache to the account's email address rather than the UID.
 type ResumeParams struct {
+	Username         string `json:"username,omitempty"`
 	UID              string `json:"uid"`
 	RefreshToken     string `json:"refresh_token"`
 	SaltedPassphrase []byte `json:"salted_passphrase"`
 }
 
-// AuthWithHVParams retries Auth after the user completes a CAPTCHA challenge.
-// HVToken is the hCaptcha response token captured from the browser.
+// AuthWithHVParams retries Auth after the user completes a human verification
+// challenge. Type is the verification method: "captcha", "email", or "sms".
+// HVToken is the solved token (composite captcha string, or the plain code
+// delivered by email/SMS).
 type AuthWithHVParams struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
 	HVToken  string `json:"hv_token"`
+	Type     string `json:"type"` // "captcha" | "email" | "sms"
+}
+
+// SendCodeParams asks Proton to deliver a verification code to the user's
+// registered email address. Type must be "email".
+type SendCodeParams struct {
+	Username string `json:"username"`
+	Type     string `json:"type"`    // "email"
+	Address  string `json:"address"` // must equal the Proton account address
 }
 
 // GetCaptchaParams fetches the captcha HTML for a given HV token.

@@ -141,11 +141,15 @@ func main() {
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, &rpc.RPCError{Code: rpc.ErrInvalidArg, Message: err.Error()}
 		}
+		resumeAccount := p.Username
+		if resumeAccount == "" {
+			resumeAccount = p.UID
+		}
 		s, creds, err := drive.ResumeSession(ctx, mgr, drive.SessionCredentials{
 			UID:              p.UID,
 			RefreshToken:     p.RefreshToken,
 			SaltedPassphrase: p.SaltedPassphrase,
-		})
+		}, resumeAccount)
 		if err != nil {
 			return nil, &rpc.RPCError{Code: rpc.ErrAuthFailed, Message: err.Error()}
 		}
@@ -184,7 +188,7 @@ func main() {
 				log.Printf("  skip %s: GetName error: %v", l.LinkID, err)
 				continue
 			}
-			log.Printf("  entry %q dir=%v size=%d", name, l.Type == proton.LinkTypeFolder, l.Size)
+			log.Printf("  entry %q type=%d dir=%v size=%d", name, l.Type, l.Type == proton.LinkTypeFolder, l.Size)
 			result.Entries = append(result.Entries, rpc.Entry{
 				Name:  name,
 				IsDir: l.Type == proton.LinkTypeFolder,
@@ -237,31 +241,12 @@ func main() {
 			return nil, &rpc.RPCError{Code: rpc.ErrInvalidArg, Message: "not a file"}
 		}
 
-		nodeKR, err := link.GetKeyRing(parentKR, s.AddrKR())
+		data, err := s.ReadFileContent(ctx, link, parentKR)
 		if err != nil {
-			return nil, err
-		}
-		sessionKey, err := link.GetSessionKey(nodeKR)
-		if err != nil {
-			return nil, err
-		}
-
-		rev, err := s.GetRevision(ctx, link.LinkID, link.FileProperties.ActiveRevision.ID, 1, 100)
-		if err != nil {
-			return nil, err
-		}
-
-		var data []byte
-		for _, block := range rev.Blocks {
-			enc, err := s.GetBlock(ctx, block.BareURL, block.Token)
-			if err != nil {
-				return nil, err
+			if errors.Is(err, drive.ErrOffline) {
+				return nil, rpc.Offline("network unreachable and file not in cache")
 			}
-			plain, err := sessionKey.Decrypt(enc)
-			if err != nil {
-				return nil, err
-			}
-			data = append(data, plain.GetBinary()...)
+			return nil, err
 		}
 
 		if p.Offset > int64(len(data)) {
