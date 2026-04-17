@@ -284,20 +284,54 @@ func (p *EventPoller) handle(le proton.LinkEvent) {
 		}
 
 	default: // LinkEventUpdate, LinkEventUpdateMetadata
-		// Capture old listing BEFORE invalidation so we can diff.
+		// Capture BOTH possible directory listings before any invalidation.
+		// We need the path's own listing (if it is a dir we've listed) AND
+		// the parent listing (if the event is on an item inside a directory).
 		oldLinks, _, hasOld := p.s.meta.GetListStale(path)
+		oldParentLinks, _, hasOldParent := p.s.meta.GetListStale(parentPath)
+
+		_, hasKR := p.s.nodeKRs[linkID]
+		_, hasParentKR := p.s.nodeKRs[parentID]
+		log.Printf("events: default: path=%q hasOld=%v hasKR=%v parentPath=%q hasOldParent=%v hasParentKR=%v",
+			path, hasOld, hasKR, parentPath, hasOldParent, hasParentKR)
 
 		p.s.meta.InvalidatePath(path)
+		if parentPath != "" && parentPath != path {
+			p.s.meta.InvalidatePath(parentPath)
+		}
 		if path == "" {
 			p.s.meta.invalidateLinkID(parentID)
 		}
 		p.s.blocks.InvalidateLink(linkID)
 
-		// Diff-based detection: when a directory's metadata changes, something
-		// in it was added, removed, or renamed. Re-list and emit specific events.
+		// Try diff on the link itself (when it is a directory we have listed).
 		if path != "" && hasOld {
 			if dirKR, ok := p.s.nodeKRs[linkID]; ok {
 				if p.diffAndEmit(context.Background(), path, linkID, dirKR, oldLinks) {
+					return
+				}
+			}
+		}
+
+		// Try diff on the parent (when the event is on a file/dir inside a parent
+		// we have listed — e.g. a file whose parent listing is cached).
+		if parentPath != "" && hasOldParent {
+			if parentKR, ok := p.s.nodeKRs[parentID]; ok {
+				if p.diffAndEmit(context.Background(), parentPath, parentID, parentKR, oldParentLinks) {
+					return
+				}
+			}
+		}
+
+		// Check if the item was trashed: fetch its current state from the API.
+		// This handles the case where UpdateMetadata fires on the item itself
+		// (path known) but the parent listing was not cached for a diff.
+		if path != "" {
+			if link, err := p.s.client.GetLink(context.Background(), p.s.shareID, linkID); err == nil {
+				if link.State == proton.LinkStateTrashed || link.State == proton.LinkStateDeleted {
+					log.Printf("events: trashed linkID=%s path=%q (state=%d)", linkID, path, link.State)
+					delete(p.s.linkPaths, linkID)
+					p.enqueue(DriveEvent{Type: EventDeleted, LinkID: linkID, Path: path})
 					return
 				}
 			}
@@ -331,12 +365,15 @@ func (p *EventPoller) diffAndEmit(ctx context.Context, dirPath, dirLinkID string
 		}
 	}
 
+	log.Printf("events: diff: old=%d names for %s", len(oldNames), dirPath)
+
 	// Fetch current children from the API (cache was already invalidated).
 	newLinks, err := p.s.client.ListChildren(ctx, p.s.shareID, dirLinkID, false)
 	if err != nil {
 		log.Printf("events: diff: list failed for %s: %v", dirPath, err)
 		return false
 	}
+	log.Printf("events: diff: new=%d links for %s", len(newLinks), dirPath)
 
 	// Decrypt new names, update linkPaths and meta cache.
 	newNames := make(map[string]string)
