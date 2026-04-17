@@ -133,7 +133,9 @@ proton_monitor_entry_free (gpointer data)
 
 /* Emit event_type on every monitor whose path matches file_path or is a
  * direct parent of it (directory monitor is notified when a child changes).
- * When file_path is NULL, emit on all monitors (full-refresh fallback). */
+ * When file_path is NULL the specific path is unknown; emit CHANGED on every
+ * monitor's own path so clients re-enumerate rather than being told the
+ * directory itself was created/deleted. */
 static void
 emit_on_monitors (GVfsBackendProton *self,
                   GFileMonitorEvent  event_type,
@@ -145,13 +147,23 @@ emit_on_monitors (GVfsBackendProton *self,
       if (!entry->monitor)
         continue; /* finalised */
 
-      gboolean match = (file_path == NULL)
-        || g_str_equal (entry->path, file_path)
-        || g_str_has_prefix (file_path, entry->path);
+      if (file_path == NULL)
+        {
+          /* Path unknown — tell every watcher its directory may have changed. */
+          g_vfs_monitor_emit_event (entry->monitor,
+                                    G_FILE_MONITOR_EVENT_CHANGED,
+                                    entry->path, NULL);
+          continue;
+        }
+
+      gsize plen = strlen (entry->path);
+      gboolean match =
+        g_str_equal (entry->path, file_path) ||
+        (g_str_has_prefix (file_path, entry->path) &&
+         (entry->path[plen - 1] == '/' || file_path[plen] == '/'));
 
       if (match)
-        g_vfs_monitor_emit_event (entry->monitor, event_type,
-                                  file_path ? file_path : entry->path, NULL);
+        g_vfs_monitor_emit_event (entry->monitor, event_type, file_path, NULL);
     }
 }
 
