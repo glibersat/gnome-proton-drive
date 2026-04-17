@@ -26,17 +26,18 @@ import (
 // and invalidates stale cache entries as changes arrive.
 // See metacache.go, blockcache.go, and events.go for details.
 type Session struct {
-	client  *proton.Client
-	shareID string
-	rootID  string
-	account string                     // email address — scopes the block cache directory
-	addrKR  *crypto.KeyRing            // primary address keyring
-	shareKR *crypto.KeyRing            // share keyring (unlocked with addrKR)
-	nodeKRs map[string]*crypto.KeyRing // linkID → decrypted node keyring (cache)
-	linkPaths map[string]string        // linkID → absolute path (reverse map for event resolution)
-	meta    *MetaCache                 // short-lived metadata cache
-	blocks  *BlockCache                // persistent block cache (nil if unavailable)
-	poller  *EventPoller               // background share-event poller
+	client   *proton.Client
+	shareID  string
+	volumeID string                    // volume that owns the main share (for volume-level events)
+	rootID   string
+	account  string                     // email address — scopes the block cache directory
+	addrKR   *crypto.KeyRing            // primary address keyring
+	shareKR  *crypto.KeyRing            // share keyring (unlocked with addrKR)
+	nodeKRs  map[string]*crypto.KeyRing // linkID → decrypted node keyring (cache)
+	linkPaths map[string]string         // linkID → absolute path (reverse map for event resolution)
+	meta     *MetaCache                 // short-lived metadata cache
+	blocks   *BlockCache                // persistent block cache (nil if unavailable)
+	poller   *EventPoller               // background share-event poller
 }
 
 // HVRequiredError is returned by NewSession when Proton requires a CAPTCHA.
@@ -81,7 +82,7 @@ func NewSession(ctx context.Context, mgr *proton.Manager, username, password str
 		return nil, SessionCredentials{}, err
 	}
 
-	shareID, rootID, err := findMainShare(ctx, c)
+	shareID, volumeID, rootID, err := findMainShare(ctx, c)
 	if err != nil {
 		_ = c.AuthDelete(ctx)
 		return nil, SessionCredentials{}, err
@@ -92,7 +93,7 @@ func NewSession(ctx context.Context, mgr *proton.Manager, username, password str
 		RefreshToken:     auth.RefreshToken,
 		SaltedPassphrase: saltedPass,
 	}
-	return newSession(c, shareID, rootID, username, addrKR), creds, nil
+	return newSession(c, shareID, volumeID, rootID, username, addrKR), creds, nil
 }
 
 // NewSessionWithHV retries SRP login after the user completes a human
@@ -114,7 +115,7 @@ func NewSessionWithHV(ctx context.Context, mgr *proton.Manager, username, passwo
 		return nil, SessionCredentials{}, err
 	}
 
-	shareID, rootID, err := findMainShare(ctx, c)
+	shareID, volumeID, rootID, err := findMainShare(ctx, c)
 	if err != nil {
 		_ = c.AuthDelete(ctx)
 		return nil, SessionCredentials{}, err
@@ -125,7 +126,7 @@ func NewSessionWithHV(ctx context.Context, mgr *proton.Manager, username, passwo
 		RefreshToken:     auth.RefreshToken,
 		SaltedPassphrase: saltedPass,
 	}
-	return newSession(c, shareID, rootID, username, addrKR), creds, nil
+	return newSession(c, shareID, volumeID, rootID, username, addrKR), creds, nil
 }
 
 // ResumeSession restores a fully authenticated session from the three values
@@ -144,7 +145,7 @@ func ResumeSession(ctx context.Context, mgr *proton.Manager, creds SessionCreden
 		return nil, SessionCredentials{}, err
 	}
 
-	shareID, rootID, err := findMainShare(ctx, c)
+	shareID, volumeID, rootID, err := findMainShare(ctx, c)
 	if err != nil {
 		_ = c.AuthDelete(ctx)
 		return nil, SessionCredentials{}, err
@@ -159,16 +160,17 @@ func ResumeSession(ctx context.Context, mgr *proton.Manager, creds SessionCreden
 		RefreshToken:     auth.RefreshToken,
 		SaltedPassphrase: creds.SaltedPassphrase,
 	}
-	return newSession(c, shareID, rootID, account, addrKR), newCreds, nil
+	return newSession(c, shareID, volumeID, rootID, account, addrKR), newCreds, nil
 }
 
 // newSession is the single place where Session is constructed.  It
 // initialises the metadata cache and, if the cache directory is reachable, the
 // persistent block cache.
-func newSession(c *proton.Client, shareID, rootID, account string, addrKR *crypto.KeyRing) *Session {
+func newSession(c *proton.Client, shareID, volumeID, rootID, account string, addrKR *crypto.KeyRing) *Session {
 	s := &Session{
 		client:    c,
 		shareID:   shareID,
+		volumeID:  volumeID,
 		rootID:    rootID,
 		account:   account,
 		addrKR:    addrKR,
@@ -619,17 +621,17 @@ func unlockWithSaltedPassphrase(ctx context.Context, c *proton.Client, saltedPas
 	return nil, fmt.Errorf("no address keyring found")
 }
 
-func findMainShare(ctx context.Context, c *proton.Client) (string, string, error) {
+func findMainShare(ctx context.Context, c *proton.Client) (shareID, volumeID, rootID string, err error) {
 	shares, err := c.ListShares(ctx, false)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 
 	for _, s := range shares {
 		if s.Type == proton.ShareTypeMain {
-			return s.ShareID, s.LinkID, nil
+			return s.ShareID, s.VolumeID, s.LinkID, nil
 		}
 	}
 
-	return "", "", fmt.Errorf("no main Drive share found")
+	return "", "", "", fmt.Errorf("no main Drive share found")
 }

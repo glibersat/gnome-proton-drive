@@ -3,6 +3,9 @@ package drive
 import (
 	"context"
 	"log"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -45,11 +48,12 @@ type DriveEvent struct {
 // called immediately so that the next Stat / ListChildren / ReadFileContent
 // hits the API rather than a stale cache entry.
 type EventPoller struct {
-	s        *Session
-	interval time.Duration
+	s          *Session
+	interval   time.Duration
+	anchorPath string // path to the persisted anchor file
 
-	mu     sync.Mutex
-	queue  []DriveEvent // bounded ring; oldest dropped when full
+	mu    sync.Mutex
+	queue []DriveEvent // bounded ring; oldest dropped when full
 
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -59,23 +63,38 @@ func newEventPoller(s *Session, interval time.Duration) *EventPoller {
 	if interval == 0 {
 		interval = defaultPollInterval
 	}
-	return &EventPoller{
+	p := &EventPoller{
 		s:        s,
 		interval: interval,
 		done:     make(chan struct{}),
 	}
+	if base, err := blockCacheBase(s.account); err == nil {
+		p.anchorPath = filepath.Join(base, "anchor")
+	}
+	return p
 }
 
 // Start fetches the initial event anchor and launches the polling goroutine.
 // It is a no-op if the session has no client (useful in tests).
+//
+// The anchor is loaded from disk when available so that events are not missed
+// across helper restarts.  If no persisted anchor exists (first run or cache
+// missing), the latest volume event ID is fetched from the API.
 func (p *EventPoller) Start(ctx context.Context) {
-	eventID, err := p.s.client.GetLatestShareEventID(ctx, p.s.shareID)
-	if err != nil {
-		log.Printf("events: could not get initial event anchor: %v — polling disabled", err)
-		close(p.done)
-		return
+	eventID := p.loadAnchor()
+	if eventID == "" {
+		var err error
+		eventID, err = p.s.client.GetLatestVolumeEventID(ctx, p.s.volumeID)
+		if err != nil {
+			log.Printf("events: could not get initial event anchor: %v — polling disabled", err)
+			close(p.done)
+			return
+		}
+		log.Printf("events: no persisted anchor — fetched latest volume anchor %s", eventID)
+	} else {
+		log.Printf("events: resumed from persisted anchor %s", eventID)
 	}
-	log.Printf("events: starting poller (interval %s, anchor %s)", p.interval, eventID)
+	log.Printf("events: starting poller (interval %s)", p.interval)
 
 	pollCtx, cancel := context.WithCancel(context.Background())
 	p.cancel = cancel
@@ -121,7 +140,7 @@ func (p *EventPoller) loop(ctx context.Context, eventID string) {
 // poll fetches new events since eventID, processes them, and returns the
 // updated anchor for the next call.
 func (p *EventPoller) poll(ctx context.Context, eventID string) string {
-	ev, err := p.s.client.GetShareEvent(ctx, p.s.shareID, eventID)
+	ev, err := p.s.client.GetVolumeEvent(ctx, p.s.volumeID, eventID)
 	if err != nil {
 		if !isOfflineError(err) {
 			log.Printf("events: poll error: %v", err)
@@ -129,10 +148,26 @@ func (p *EventPoller) poll(ctx context.Context, eventID string) string {
 		return eventID // retain anchor; retry next tick
 	}
 
+	// Empty EventID means the server has forgotten this anchor (e.g. after a
+	// long outage).  Re-anchor at the current head and request a full refresh.
+	if ev.EventID == "" {
+		log.Printf("events: anchor %s lost — re-anchoring at current head", eventID)
+		newID, err := p.s.client.GetLatestVolumeEventID(ctx, p.s.volumeID)
+		if err != nil {
+			log.Printf("events: re-anchor failed: %v", err)
+			return eventID
+		}
+		p.s.meta.invalidateAll()
+		p.enqueue(DriveEvent{Type: EventChanged, Path: "/"})
+		p.saveAnchor(newID)
+		return newID
+	}
+
 	if ev.Refresh {
 		log.Printf("events: server requested full refresh")
 		p.s.meta.invalidateAll()
 		p.enqueue(DriveEvent{Type: EventChanged, Path: "/"})
+		p.saveAnchor(ev.EventID)
 		return ev.EventID
 	}
 
@@ -140,7 +175,36 @@ func (p *EventPoller) poll(ctx context.Context, eventID string) string {
 		p.handle(le)
 	}
 
+	p.saveAnchor(ev.EventID)
 	return ev.EventID
+}
+
+// loadAnchor reads the persisted event anchor from disk.
+// Returns an empty string when no anchor file exists or on any read error.
+func (p *EventPoller) loadAnchor() string {
+	if p.anchorPath == "" {
+		return ""
+	}
+	data, err := os.ReadFile(p.anchorPath)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// saveAnchor writes the event anchor to disk so polling can resume after a
+// helper restart without missing events.
+func (p *EventPoller) saveAnchor(eventID string) {
+	if p.anchorPath == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(p.anchorPath), 0o700); err != nil {
+		log.Printf("events: save anchor mkdir: %v", err)
+		return
+	}
+	if err := os.WriteFile(p.anchorPath, []byte(eventID), 0o600); err != nil {
+		log.Printf("events: save anchor: %v", err)
+	}
 }
 
 func (p *EventPoller) handle(le proton.LinkEvent) {
