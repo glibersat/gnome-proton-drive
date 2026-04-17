@@ -123,47 +123,64 @@ by skipping blocks whose byte range falls entirely before `offset`.
 
 ### B3. Write operations
 
-Three sub-tasks, each blocked on `go-proton-api` upstream:
+The API calls exist and their parameters are fully documented from the Windows
+client (see `docs/reference.md`). Three sub-tasks remain blocked on
+`go-proton-api` not wrapping the required crypto steps:
 
-| Sub-task | Blocker |
-|---|---|
-| `Mkdir` | Need crypto helpers to generate `NodeKey` + `NodePassphrase` for a new folder node. `go-proton-api` exposes `CreateFolder` but not the key-generation step. |
-| `WriteFile` | Need block encryption + `RequestBlockUpload` + `UpdateRevision`. API calls exist; crypto wrapper (generate session key, encrypt blocks, sign manifest) does not. |
-| `Move` / `Rename` | `go-proton-api` has no `MoveLink` call. Needs upstream addition or raw HTTP against `/drive/shares/{id}/files/{id}/move`. |
+| Sub-task | API | Blocker |
+|---|---|---|
+| `Mkdir` | `POST /shares/{id}/folders` | Must generate `NodeKey` (Ed25519+X25519), random `NodePassphrase` (32 bytes, base64), encrypt passphrase with parent `NodeKey`, compute `NameHash = HMAC-SHA256(hashKey, name)`. go-proton-api exposes the endpoint but not the key-generation helpers. |
+| `WriteFile` | `POST /shares/{id}/files` → `POST /shares/{id}/files/{id}/revisions` → `POST /blocks` → commit | Blocks are 4 MiB, encrypted with a per-file `SessionKey` (PGP data packet), signed, SHA-256 hashed. Upload pipeline: batch-request URLs, then PUT multipart (3 concurrent). Crypto wrapper missing from go-proton-api. |
+| `Move` / `Rename` | `PUT /shares/{id}/links/{id}/move` | Passphrase must be re-encrypted under the new parent's `NodeKey`; `NameHash` recomputed. `MoveLink` call missing from go-proton-api. |
 
 Track against `go-proton-api` releases. When unblocked, implement in
-`drive/session.go` and register the `WriteFile` handler in `main.go`.
+`drive/session.go` and register the handlers in `main.go`.
 
-### B4. Event polling for two-way sync
+### B4. Event polling ✅
 
-Proton Drive exposes a `/drive/shares/{id}/events/{eventID}` endpoint. Poll on
-a configurable interval (default 30 s) and push invalidation events over the
-RPC connection:
+Polls `/drive/volumes/{id}/events/{anchorID}` every 30 s via `EventPoller`
+(`helper/drive/events.go`). The C backend drains the queue every 5 s via
+`GetEvents` RPC and emits `GVfsMonitor` notifications.
 
-```json
-{"event": "changed", "path": "/Documents/file.txt"}
-{"event": "deleted", "path": "/old-name.txt"}
-{"event": "created", "path": "/new-folder"}
-```
+**What works:**
+- Volume-level event endpoint used (covers all shares in one poll).
+- Anchor persisted to `~/.cache/proton-drive/<account>/anchor` after each
+  successful batch; resumed on restart so no events are missed.
+- Stale anchor recovered automatically: on empty `EventID` response the poller
+  re-anchors at the current head and requests a full metadata refresh.
+- `MetaCache` and `BlockCache` invalidated immediately on receipt.
+- Diff-based change detection: for `Create` and `UpdateMetadata` events the
+  poller captures the old directory listing from the cache before invalidation,
+  fetches the new listing from the API, and emits precise `CREATED` / `DELETED`
+  events with the child path — which is what Nautilus requires to add/remove
+  entries without a full re-enumeration.
+- Trash detection: when a `UpdateMetadata` event arrives for a known path, the
+  helper fetches the link state; `LinkStateTrashed` and `LinkStateDeleted` both
+  emit `EventDeleted` so Nautilus removes the entry immediately.
+- GVfs monitors triggered with `CREATED` / `DELETED` / `CHANGED` on the
+  specific child path, not just the parent directory.
 
-The GVfs backend consumes these to call `g_vfs_monitor_emit_event()`,
-triggering Nautilus refreshes without polling from the C side.
+**Known gaps:**
+
+| Gap | Impact | Fix |
+|---|---|---|
+| `HasMoreData` not drained immediately | Burst of events takes many 30 s ticks to process | Loop until `HasMoreData == false` before waiting for next tick |
+| `UpdateMetadata` not distinguished from `EventChanged` for renames/moves | Renames appear as delete+create instead of move | Add `EventMoved` type for future C3 move propagation (B3 dependency) |
 
 ---
 
 ## Track C — GVfs backend
 
-### C1. Backend skeleton
+### C1. Backend skeleton ✅
 
-Implement `gvfsd-proton` in C, following the pattern of `gvfsd-sftp`:
+Implements `gvfsd-proton` in C (`backend/`):
 
-- Subclass `GVfsBackend`.
-- On `mount`, read credentials from libsecret (A1), spawn
-  `proton-drive-helper --socket <path> --account <email>`, send `Auth`, and
-  verify the connection.
-- Implement read-only VFS ops via RPC: `open_for_read`, `read`, `close_read`,
+- Subclasses `GVfsBackend`.
+- On `mount`: reads credentials from libsecret via `secret-tool`, spawns
+  `proton-drive-helper`, calls `ResumeSession`.
+- Read-only VFS ops via RPC: `open_for_read`, `read`, `close_read`,
   `query_info`, `enumerate`.
-- Stub write ops with `G_IO_ERROR_NOT_SUPPORTED` until B3 lands.
+- Write ops return `G_IO_ERROR_NOT_SUPPORTED` until B3 lands.
 
 ### C2. Volume monitor
 
@@ -180,24 +197,36 @@ A `gvfsd-proton-volume-monitor` daemon that makes the drive appear in Nautilus:
 
 ### C3. Two-way sync
 
-- **Remote → local:** consume events from B4; call `g_file_monitor_emit_event()`
-  so Nautilus and open file handles see changes without re-stating.
-- **Local → remote:** VFS write ops (once B3 is done) go directly to the API
-  via the helper — no separate sync step.
-- **Conflict policy:** last-write-wins for now (matches Proton Drive web
-  behaviour). Revisit once revision history API is accessible.
+**Remote → local ✅ (partial)**
+
+- B4 event polling drives `GVfsMonitor` notifications via a 5 s GLib timer
+  in `gvfsbackendproton.c`.
+- `do_create_dir_monitor` and `do_create_file_monitor` vtable slots implemented.
+- When the specific changed file path is unknown, `CHANGED` is emitted on the
+  parent directory monitor so the file manager re-enumerates.
+- Known gap: monitor notifications fail silently when the GVfs client has
+  disconnected (D-Bus name gone). The monitor entry remains in `self->monitors`
+  until its `GVfsMonitor` GObject is finalised.
+
+**Local → remote:** VFS write ops (once B3 is done) go directly to the API
+via the helper — no separate sync step.
+
+**Conflict policy (from Windows client reference):** remote wins on edit-edit
+conflicts; the local file is backed up with a `_conflict` suffix before
+overwrite. Revisit once revision history API is accessible.
 
 ### C4. Caching and offline access
 
-Every file read currently fetches all blocks from the API. Two complementary
-layers are needed:
-
 **Metadata cache (in-process, Track B) ✅**
 
-- `ListDir` and `Stat` results cached in the helper with a 30 s TTL
-  (`helper/drive/metacache.go`).
+- `ListDir` and `Stat` results cached in the helper (`helper/drive/metacache.go`).
+- Currently TTL-based (30 s); planned replacement with an entry-count LRU — the
+  B4 event poller already calls `InvalidatePath` on every remote change, so the
+  TTL exists only as a fallback for missed events. With volume-level events and
+  anchor persistence, correctness is guaranteed by invalidation rather than expiry;
+  a pure LRU (no TTL) reduces unnecessary API round-trips for hot directories.
 - Stale entries served when the API is unreachable (offline fallback).
-- `InvalidatePath(path)` stub wired — B4 integration is a one-liner.
+- `InvalidatePath(path)` wired to B4 events.
 - Eliminates redundant API round-trips when Nautilus re-stats files during
   enumeration and drag-and-drop.
 
@@ -211,8 +240,7 @@ layers are needed:
 - 2 GiB LRU eviction; mtime updated on each cache hit for accurate ordering.
 - **Offline reads** work for previously-opened files (`rpc.ErrOffline = -32005`
   returned to the C backend when offline with no cached data).
-- `InvalidateLink(linkID)` stub wired — B4 integration is a one-liner.
-- Cache hit/miss/stale events logged by the helper.
+- `InvalidateLink(linkID)` wired to B4 events.
 
 **Remaining for full C4:**
 
@@ -235,13 +263,13 @@ layers are needed:
 
 ## Milestones
 
-| Milestone | Tracks | Deliverable |
-|---|---|---|
-| **M1 — Read-only mount** | A1 + A2 + B1 + C1 + C2 | Proton Drive visible in Nautilus; files openable read-only |
-| **M2 — Live updates** | B4 + C3 (remote→local) | Nautilus refreshes when remote changes |
-| **M3 — Full read/write** | B3 + C1 (writes) + C3 | Create, edit, move, delete from Nautilus |
-| **M4 — Settings panel** | A3-a or A3-b | Proton Drive in GNOME Settings → Online Accounts |
-| **M5 — Cache + offline** | C4 | Fast repeated access; reads served from disk when offline — *read-only tier done; pinning and write-queue pending* |
+| Milestone | Tracks | Deliverable | Status |
+|---|---|---|---|
+| **M1 — Read-only mount** | A1 + A2 + B1 + C1 + C2 | Proton Drive visible in Nautilus; files openable read-only | In progress |
+| **M2 — Live updates** | B4 + C3 (remote→local) | Nautilus refreshes when remote changes | ✅ Core complete — volume-level polling, anchor persistence, diff-based CREATED/DELETED, trash detection all working. `HasMoreData` paging and move/rename distinction pending |
+| **M3 — Full read/write** | B3 + C1 (writes) + C3 | Create, edit, move, delete from Nautilus | Blocked on go-proton-api |
+| **M4 — Settings panel** | A3-a or A3-b | Proton Drive in GNOME Settings → Online Accounts | Not started |
+| **M5 — Cache + offline** | C4 | Fast repeated access; reads served from disk when offline — *read-only tier done; pinning and write-queue pending* | Partial |
 
 ---
 
@@ -260,3 +288,10 @@ layers are needed:
 4. **go-proton-api stability:** Pinned to a pre-1.0 pseudo-version at a
    specific commit. Policy needed: periodic manual upgrade or request a
    semver tag from upstream.
+
+5. **MetaCache TTL vs. LRU:** The current 30 s TTL is a correctness safety net
+   for missed events. Now that volume-level polling with anchor persistence is
+   in place, event-driven invalidation (`InvalidatePath`) is the primary
+   freshness mechanism. Replace the TTL map with a pure entry-count LRU so hot
+   directories are never unnecessarily re-fetched; the offline stale fallback
+   (`GetListStale` / `GetStatStale`) continues to work unchanged.

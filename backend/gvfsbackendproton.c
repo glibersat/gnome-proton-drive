@@ -7,7 +7,11 @@
 #include <gvfsjobopenforread.h>
 #include <gvfsjobread.h>
 #include <gvfsjobcloseread.h>
+#include <gvfsmonitor.h>
+#include <gvfsjobcreatemonitor.h>
 
+/* How often (seconds) the backend polls GetEvents from the helper. */
+#define POLL_INTERVAL_S 5
 
 /* Per-open-file handle: tracks path and current read offset. */
 typedef struct {
@@ -15,9 +19,18 @@ typedef struct {
   gint64  offset;
 } ProtonHandle;
 
+/* Weak-reference wrapper for a GVfsMonitor stored in self->monitors.
+ * monitor is zeroed by GLib when the underlying object is finalised. */
+typedef struct {
+  gchar       *path;
+  GVfsMonitor *monitor; /* weak ref — may become NULL */
+} ProtonMonitorEntry;
+
 struct _GVfsBackendProton {
   GVfsBackend  parent_instance;
   ProtonRpc   *rpc;
+  GPtrArray   *monitors; /* ProtonMonitorEntry*, weak refs to GVfsMonitor */
+  guint        poll_id;  /* GLib timeout source id, 0 when inactive */
 };
 
 struct _GVfsBackendProtonClass {
@@ -65,6 +78,16 @@ fill_file_info (GFileInfo *info, ProtonEntry *e)
   GDateTime *dt = g_date_time_new_from_unix_utc (e->mtime);
   g_file_info_set_modification_date_time (info, dt);
   g_date_time_unref (dt);
+
+  if (e->link_id)
+    g_file_info_set_attribute_string (info, G_FILE_ATTRIBUTE_ID_FILE, e->link_id);
+
+  /* revision_id is the perfect etag: stable while content is unchanged,
+   * updated exactly when a new revision is uploaded. The thumbnail factory
+   * uses this instead of mtime when available, avoiding spurious regeneration
+   * due to timestamp precision. */
+  if (e->revision_id)
+    g_file_info_set_attribute_string (info, G_FILE_ATTRIBUTE_ETAG_VALUE, e->revision_id);
 }
 
 /* ---------- libsecret helpers ---------- */
@@ -103,6 +126,145 @@ secret_tool_store (const gchar *username, const gchar *field, const gchar *secre
       g_error_free (err);
     }
   g_object_unref (proc);
+}
+
+/* ---------- monitor helpers ---------- */
+
+static void
+proton_monitor_entry_free (gpointer data)
+{
+  ProtonMonitorEntry *entry = data;
+  if (entry->monitor)
+    g_object_remove_weak_pointer (G_OBJECT (entry->monitor),
+                                  (gpointer *) &entry->monitor);
+  g_free (entry->path);
+  g_free (entry);
+}
+
+/* Emit event_type on every monitor whose path matches file_path or is a
+ * direct parent of it (directory monitor is notified when a child changes).
+ * When file_path is NULL the specific path is unknown; emit CHANGED on every
+ * monitor's own path so clients re-enumerate rather than being told the
+ * directory itself was created/deleted. */
+static void
+emit_on_monitors (GVfsBackendProton *self,
+                  GFileMonitorEvent  event_type,
+                  const gchar       *file_path)
+{
+  for (guint i = 0; i < self->monitors->len; i++)
+    {
+      ProtonMonitorEntry *entry = g_ptr_array_index (self->monitors, i);
+      if (!entry->monitor)
+        continue; /* finalised */
+
+      if (file_path == NULL)
+        {
+          /* Path unknown — tell every watcher its directory may have changed. */
+          g_vfs_monitor_emit_event (entry->monitor,
+                                    G_FILE_MONITOR_EVENT_CHANGED,
+                                    entry->path, NULL);
+          continue;
+        }
+
+      gsize plen = strlen (entry->path);
+      gboolean match =
+        g_str_equal (entry->path, file_path) ||
+        (g_str_has_prefix (file_path, entry->path) &&
+         (entry->path[plen - 1] == '/' || file_path[plen] == '/'));
+
+      if (match)
+        {
+          g_message ("emit_on_monitors: -> monitor@%s  event=%d  file=%s",
+                     entry->path, event_type, file_path);
+          g_vfs_monitor_emit_event (entry->monitor, event_type, file_path, NULL);
+        }
+    }
+}
+
+/* GLib timeout callback — runs on the GLib main loop every POLL_INTERVAL_S. */
+static gboolean
+poll_events_cb (gpointer user_data)
+{
+  GVfsBackendProton *self = G_VFS_BACKEND_PROTON (user_data);
+  GError *error = NULL;
+
+  g_debug ("poll_events: tick (monitors=%u)", self->monitors->len);
+
+  ProtonEvent **events = proton_rpc_get_events (self->rpc, &error);
+  if (!events)
+    {
+      if (error)
+        {
+          g_warning ("poll_events: RPC error: %s", error->message);
+          g_error_free (error);
+        }
+      return G_SOURCE_CONTINUE;
+    }
+
+  guint n_events = 0;
+  for (ProtonEvent **ev = events; *ev; ev++)
+    n_events++;
+
+  if (n_events > 0)
+    g_message ("poll_events: %u event(s), %u monitor(s)", n_events, self->monitors->len);
+
+  for (ProtonEvent **ev = events; *ev; ev++)
+    {
+      GFileMonitorEvent gev;
+      if (g_str_equal ((*ev)->type, "deleted"))
+        gev = G_FILE_MONITOR_EVENT_DELETED;
+      else if (g_str_equal ((*ev)->type, "created"))
+        gev = G_FILE_MONITOR_EVENT_CREATED;
+      else
+        gev = G_FILE_MONITOR_EVENT_CHANGED;
+
+      g_message ("poll_events: dispatch type=%s path=%s",
+                 (*ev)->type, (*ev)->path ? (*ev)->path : "(null)");
+      emit_on_monitors (self, gev, (*ev)->path);
+    }
+
+  proton_events_free (events);
+  return G_SOURCE_CONTINUE;
+}
+
+/* ---------- monitor vtable ---------- */
+
+static void
+register_monitor (GVfsBackendProton    *self,
+                  GVfsJobCreateMonitor *job,
+                  const gchar          *filename)
+{
+  GVfsMonitor *monitor = g_vfs_monitor_new (G_VFS_BACKEND (self));
+  g_vfs_job_create_monitor_set_monitor (job, monitor);
+
+  ProtonMonitorEntry *entry = g_new0 (ProtonMonitorEntry, 1);
+  entry->path    = g_strdup (filename);
+  entry->monitor = monitor;
+  g_object_add_weak_pointer (G_OBJECT (monitor), (gpointer *) &entry->monitor);
+
+  g_ptr_array_add (self->monitors, entry);
+  g_object_unref (monitor); /* entry holds a weak ref; job holds the strong ref */
+
+  g_message ("register_monitor: path=%s (total=%u)", filename, self->monitors->len);
+  g_vfs_job_succeeded (G_VFS_JOB (job));
+}
+
+static void
+do_create_dir_monitor (GVfsBackend          *backend,
+                       GVfsJobCreateMonitor *job,
+                       const gchar          *filename,
+                       GFileMonitorFlags     flags G_GNUC_UNUSED)
+{
+  register_monitor (G_VFS_BACKEND_PROTON (backend), job, filename);
+}
+
+static void
+do_create_file_monitor (GVfsBackend          *backend,
+                        GVfsJobCreateMonitor *job,
+                        const gchar          *filename,
+                        GFileMonitorFlags     flags G_GNUC_UNUSED)
+{
+  register_monitor (G_VFS_BACKEND_PROTON (backend), job, filename);
 }
 
 /* ---------- helper spawn ---------- */
@@ -311,6 +473,9 @@ cred_cleanup:
   g_vfs_backend_set_user_visible (backend, TRUE);
 
   g_vfs_job_succeeded (G_VFS_JOB (job));
+
+  /* Start the event-polling timer now that the RPC connection is live. */
+  self->poll_id = g_timeout_add_seconds (POLL_INTERVAL_S, poll_events_cb, self);
 }
 
 static void
@@ -445,6 +610,9 @@ static void
 g_vfs_backend_proton_finalize (GObject *object)
 {
   GVfsBackendProton *self = G_VFS_BACKEND_PROTON (object);
+  if (self->poll_id)
+    g_source_remove (self->poll_id);
+  g_ptr_array_unref (self->monitors);
   proton_rpc_free (self->rpc);
   G_OBJECT_CLASS (g_vfs_backend_proton_parent_class)->finalize (object);
 }
@@ -452,6 +620,7 @@ g_vfs_backend_proton_finalize (GObject *object)
 static void
 g_vfs_backend_proton_init (GVfsBackendProton *self)
 {
+  self->monitors = g_ptr_array_new_with_free_func (proton_monitor_entry_free);
 }
 
 static void
@@ -461,11 +630,13 @@ g_vfs_backend_proton_class_init (GVfsBackendProtonClass *klass)
   GVfsBackendClass *backend_class = G_VFS_BACKEND_CLASS (klass);
 
   obj_class->finalize      = g_vfs_backend_proton_finalize;
-  backend_class->mount     = do_mount;
-  backend_class->query_info = do_query_info;
-  backend_class->enumerate  = do_enumerate;
-  backend_class->open_for_read = do_open_for_read;
-  backend_class->read          = do_read;
-  backend_class->close_read    = do_close_read;
+  backend_class->mount              = do_mount;
+  backend_class->query_info         = do_query_info;
+  backend_class->enumerate          = do_enumerate;
+  backend_class->open_for_read      = do_open_for_read;
+  backend_class->read               = do_read;
+  backend_class->close_read         = do_close_read;
+  backend_class->create_dir_monitor  = do_create_dir_monitor;
+  backend_class->create_file_monitor = do_create_file_monitor;
 }
 

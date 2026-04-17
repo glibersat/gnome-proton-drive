@@ -136,13 +136,40 @@ func (c *MetaCache) GetListStale(dirPath string) ([]proton.Link, *crypto.KeyRing
 }
 
 // InvalidatePath removes cached metadata for p and for its parent directory
-// listing.  This is the B4 event hook: future event-polling integration
-// calls this method with the changed path, and no other code changes are
-// needed.
+// listing.  This is the B4 event hook: the event poller calls this for every
+// received LinkEvent, and no other code changes are needed.
 func (c *MetaCache) InvalidatePath(p string) {
+	if p == "" {
+		return
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.stats, p)
 	delete(c.lists, p)
 	delete(c.lists, path.Dir(p))
+}
+
+// invalidateLinkID scans the stat cache for any entry whose LinkID matches
+// and removes it along with its parent list entry.  Used when a path is not
+// in the reverse map (linkID → path) but we know the linkID from an event.
+func (c *MetaCache) invalidateLinkID(linkID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for p, e := range c.stats {
+		if e.link.LinkID == linkID {
+			delete(c.stats, p)
+			delete(c.lists, p)
+			delete(c.lists, path.Dir(p))
+			return
+		}
+	}
+}
+
+// invalidateAll clears every entry.  Called when the server signals a full
+// refresh (DriveEvent.Refresh == true).
+func (c *MetaCache) invalidateAll() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.stats = make(map[string]metaStatEntry)
+	c.lists = make(map[string]metaListEntry)
 }

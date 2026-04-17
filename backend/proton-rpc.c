@@ -233,10 +233,14 @@ proton_rpc_list_dir (ProtonRpc   *rpc,
     {
       JsonObject  *e   = json_array_get_object_element (arr, i);
       ProtonEntry *ent = g_new0 (ProtonEntry, 1);
-      ent->name   = g_strdup (json_object_get_string_member (e, "name"));
-      ent->is_dir = json_object_get_boolean_member (e, "is_dir");
-      ent->size   = json_object_get_int_member (e, "size");
-      ent->mtime  = json_object_get_int_member (e, "mtime");
+      ent->name        = g_strdup (json_object_get_string_member (e, "name"));
+      ent->is_dir      = json_object_get_boolean_member (e, "is_dir");
+      ent->size        = json_object_get_int_member (e, "size");
+      ent->mtime       = json_object_get_int_member (e, "mtime");
+      if (json_object_has_member (e, "link_id"))
+        ent->link_id = g_strdup (json_object_get_string_member (e, "link_id"));
+      if (json_object_has_member (e, "revision_id"))
+        ent->revision_id = g_strdup (json_object_get_string_member (e, "revision_id"));
       entries[i]  = ent;
     }
 
@@ -260,10 +264,14 @@ proton_rpc_stat (ProtonRpc   *rpc,
 
   JsonObject  *e   = json_object_get_object_member (resp, "result");
   ProtonEntry *ent = g_new0 (ProtonEntry, 1);
-  ent->name   = g_strdup (json_object_get_string_member (e, "name"));
-  ent->is_dir = json_object_get_boolean_member (e, "is_dir");
-  ent->size   = json_object_get_int_member (e, "size");
-  ent->mtime  = json_object_get_int_member (e, "mtime");
+  ent->name        = g_strdup (json_object_get_string_member (e, "name"));
+  ent->is_dir      = json_object_get_boolean_member (e, "is_dir");
+  ent->size        = json_object_get_int_member (e, "size");
+  ent->mtime       = json_object_get_int_member (e, "mtime");
+  if (json_object_has_member (e, "link_id"))
+    ent->link_id = g_strdup (json_object_get_string_member (e, "link_id"));
+  if (json_object_has_member (e, "revision_id"))
+    ent->revision_id = g_strdup (json_object_get_string_member (e, "revision_id"));
   return ent;
 }
 
@@ -311,5 +319,54 @@ proton_entry_free (ProtonEntry *entry)
   if (!entry)
     return;
   g_free (entry->name);
+  g_free (entry->link_id);
+  g_free (entry->revision_id);
   g_free (entry);
+}
+
+ProtonEvent **
+proton_rpc_get_events (ProtonRpc *rpc, GError **error)
+{
+  g_autoptr(JsonObject) resp = call (rpc, "GetEvents", NULL, error);
+  if (!resp)
+    return NULL;
+
+  JsonObject *result = json_object_get_object_member (resp, "result");
+  JsonArray  *arr    = result ? json_object_get_array_member (result, "events") : NULL;
+  guint       n      = arr ? json_array_get_length (arr) : 0;
+
+  ProtonEvent **events = g_new0 (ProtonEvent *, n + 1); /* NULL-terminated */
+  for (guint i = 0; i < n; i++)
+    {
+      JsonObject  *ev = json_array_get_object_element (arr, i);
+      ProtonEvent *e  = g_new0 (ProtonEvent, 1);
+      e->type    = g_strdup (json_object_get_string_member (ev, "type"));
+      e->link_id = g_strdup (json_object_get_string_member (ev, "link_id"));
+      /* path is omitempty — may be absent */
+      if (json_object_has_member (ev, "path"))
+        e->path = g_strdup (json_object_get_string_member (ev, "path"));
+      events[i] = e;
+    }
+  return events;
+}
+
+void
+proton_event_free (ProtonEvent *event)
+{
+  if (!event)
+    return;
+  g_free (event->type);
+  g_free (event->link_id);
+  g_free (event->path);
+  g_free (event);
+}
+
+void
+proton_events_free (ProtonEvent **events)
+{
+  if (!events)
+    return;
+  for (ProtonEvent **e = events; *e; e++)
+    proton_event_free (*e);
+  g_free (events);
 }

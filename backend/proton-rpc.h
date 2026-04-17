@@ -15,7 +15,9 @@ typedef struct {
   gchar    *name;
   gboolean  is_dir;
   gint64    size;
-  gint64    mtime;   /* unix seconds */
+  gint64    mtime;        /* unix seconds */
+  gchar    *link_id;      /* stable Proton linkID — use as G_FILE_ATTRIBUTE_ID_FILE */
+  gchar    *revision_id;  /* active revision ID for files; NULL for directories */
 } ProtonEntry;
 
 ProtonRpc  *proton_rpc_new          (const gchar  *socket_path,
@@ -66,5 +68,21 @@ gssize        proton_rpc_read_file  (ProtonRpc    *rpc,
                                      GError      **error);
 
 void          proton_entry_free     (ProtonEntry  *entry);
+
+/* A single remote-change event returned by GetEvents.
+ * path may be NULL when the changed link was not yet visited in this session. */
+typedef struct {
+  gchar *type;    /* "changed" | "deleted" | "created" */
+  gchar *link_id;
+  gchar *path;    /* absolute POSIX path, or NULL */
+} ProtonEvent;
+
+/* Drain the helper's event queue.  Returns a NULL-terminated array of
+ * ProtonEvent* owned by the caller.  Never blocks — returns an empty array
+ * (length 0, first element NULL) when nothing is pending.
+ * Free with proton_events_free(). */
+ProtonEvent **proton_rpc_get_events (ProtonRpc *rpc, GError **error);
+void          proton_event_free     (ProtonEvent *event);
+void          proton_events_free    (ProtonEvent **events);
 
 G_END_DECLS
