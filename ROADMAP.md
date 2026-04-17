@@ -110,32 +110,27 @@ Tests must be written alongside every piece of code — never deferred.
 
 ## Track B — Go helper completion
 
-### B1. Path resolution cache ✅ (partial — in-memory only)
+### B1. Path resolution cache ✅
 
-Current state: `resolvePath` walks the tree on every call. Add an in-memory
-`linkID` cache keyed by path, invalidated by Drive events (see B4).
+`resolvePath` short-circuits on already-resolved paths and warms all cache
+layers on every tree walk:
 
-**Directory listing latency — identified optimisation queue (priority order):**
+- ✅ **MetaCache warmed during traversal** — each `client.ListChildren` result
+  is stored via `meta.SetList`; `statUncached` routes through `s.ListChildren`
+  rather than the raw client call.
+- ✅ **path→linkID forward map** — `Session.pathLinks` caches the full resolved
+  path → linkID mapping. `resolvePath` short-circuits entirely on a hit,
+  skipping the tree walk and all per-segment name-decryption crypto. Each
+  resolved segment is stored so intermediate paths are also cached. Invalidation
+  (`Session.InvalidatePath` / `invalidateLinkID` / `invalidateAll`) clears
+  `pathLinks` alongside MetaCache, keeping all layers consistent.
 
-1. **Warm MetaCache during `resolvePath` traversal** *(low effort, high impact)* —
-   `resolvePath` fetches children of every intermediate directory via the raw
-   `s.client.ListChildren` call, bypassing `MetaCache`. Storing those results
-   with `meta.SetList` turns every path walk into a free cache warm-up: a
-   subsequent `ListChildren` to any intermediate dir becomes an instant hit.
-   Fix `statUncached` (line 331) the same way — route through `s.ListChildren`
-   instead of `s.client.ListChildren`.
+**Remaining:**
 
-2. **Cache path→linkID in `resolvePath`** *(medium effort, highest steady-state gain)* —
-   `resolvePath` re-walks the full path from root on every call even when the
-   path has already been resolved. Add a forward map `path → linkID` (the
-   reverse of the existing `linkPaths`) to `MetaCache` or `Session` so that
-   `resolvePath` can short-circuit entirely for already-resolved paths,
-   eliminating the tree walk and all per-segment crypto overhead.
-
-3. **Parallel name decryption in `resolvePath`** *(medium effort, helps wide dirs)* —
-   At each path segment all child names are decrypted serially to find the
-   match. Fanning out `GetName` into goroutines (first-match via channel) cuts
-   crypto time proportionally to directory width.
+- **Parallel name decryption in `resolvePath`** *(medium effort, helps wide dirs)* —
+  At each path segment all child names are decrypted serially to find the match.
+  Fanning out `GetName` into goroutines (first-match via channel) cuts crypto
+  time proportionally to directory width.
 
 ### B2. Streaming block reads
 
