@@ -12,6 +12,10 @@ in Nautilus and GTK file choosers.
 
 ```
 Nautilus / GTK file choosers
+        ↕ GIO volume monitor
+gvfsd-proton-volume-monitor  (Vala, GVfs remote volume monitor)
+        ↕ libsecret + org.gnome.ProtonDrive D-Bus
+proton-drive-setup  (Python GTK wizard)
         ↕ GVfs VFS ops
 gvfsd-proton  (C, GVfs backend)
         ↕ Unix socket — line-delimited JSON-RPC
@@ -29,6 +33,11 @@ calls using [go-proton-api](https://github.com/ProtonMail/go-proton-api).
 appear as a native volume. The backend spawns the helper automatically on
 mount.
 
+`gvfsd-proton-volume-monitor` is a GVfs remote volume monitor daemon that
+watches the GNOME keyring and `org.gnome.ProtonDrive` D-Bus signals so
+accounts appear automatically in Nautilus without a manual `gio mount`. See
+`docs/volume-monitor.md` for the architecture.
+
 Directory listings and file metadata are cached in-process, invalidated by
 the event poller when remote changes arrive. Decrypted file content is cached
 on disk under `~/.cache/proton-drive/<account>/` so repeated reads and offline
@@ -41,6 +50,8 @@ access work without hitting the network. See `docs/caching.md` for details.
 - Go 1.22+
 - GLib/GIO 2.76+, json-glib 1.0 (headers + dev packages)
 - GVfs 1.57 (runtime libraries: `libgvfsdaemon.so`, `libgvfscommon.so`)
+- libsecret 0.20+ (headers + dev packages)
+- Vala 0.56+
 - Meson 1.0+ and Ninja
 
 ### Build everything
@@ -57,6 +68,9 @@ make build-helper
 
 # C backend only (configures Meson into _build/ on first run)
 make build-backend
+
+# Vala volume monitor only (configures Meson into _build-monitor/ on first run)
+make build-monitor
 ```
 
 ## Installation
@@ -69,6 +83,8 @@ This installs:
 - `proton-drive-helper` → `/usr/local/libexec/`
 - `gvfsd-proton` → GVfs backend directory (via `meson install`)
 - `proton.mount` → GVfs mounts directory
+- `gvfsd-proton-volume-monitor` → `/usr/local/libexec/`
+- `proton.monitor` → GVfs remote volume monitors directory
 - `proton-drive-setup` → `/usr/local/bin/`
 
 Override `PREFIX` or `DESTDIR` as needed:
@@ -98,6 +114,10 @@ login via `proton-drive-helper`, and stores the session tokens (`uid`,
 never written to disk.
 
 **2. Mount the drive:**
+
+After running the setup wizard, `gvfsd-proton-volume-monitor` detects the new
+keyring entry and the volume appears automatically in Nautilus. Click it to
+mount, or mount from the command line:
 
 ```sh
 gio mount "proton://you%40proton.me/"
@@ -186,7 +206,7 @@ one JSON object terminated by `\n`.
 | Create directory | ⏳ Pending crypto helpers in go-proton-api |
 | Move / rename | ⏳ `MoveLink` not yet in go-proton-api |
 | Write file | ⏳ Block upload + revision creation |
-| GNOME volume monitor | 🔲 Not started |
+| GNOME volume monitor | ✅ Implemented (libsecret + D-Bus watch, auto-appears in Nautilus) |
 | Event polling (remote → Nautilus) | ✅ Volume-level, anchor-persisted; `HasMoreData` paging pending |
 | Block cache re-encryption | 🔲 Currently stored as plaintext |
 | Pinned offline files | 🔲 Not started |
@@ -197,9 +217,9 @@ one JSON object terminated by `\n`.
 - **Read-only.** Write operations (`Mkdir`, `Move`, `WriteFile`) are stubbed
   pending `go-proton-api` additions: key generation for new nodes, `MoveLink`,
   and block upload helpers.
-- **No volume monitor.** The drive must be mounted manually with `gio mount`.
-  A GVfs volume monitor (making it appear automatically in Nautilus) is
-  planned for M1.
+- **Volume monitor requires restart.** After `make install`, GIO must pick up
+  the new `proton.monitor` descriptor. Log out and back in, or restart
+  `gvfsd` and the volume monitor daemon.
 - **Block cache stores plaintext.** Decrypted file content is written to
   `~/.cache/proton-drive/` without re-encryption. Rely on OS full-disk
   encryption until this is addressed.

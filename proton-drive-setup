@@ -21,8 +21,25 @@ except Exception:
     _gtk_ver = '3.0'
     from gi.repository import Gtk
 
-from gi.repository import GLib
+from gi.repository import GLib, Gio
 GTK4 = _gtk_ver == '4.0'
+
+# D-Bus interface emitted after a successful login so the volume monitor
+# shows the new account in Nautilus without waiting for a keyring poll.
+_PROTON_DRIVE_IFACE_XML = '''
+<node>
+  <interface name="org.gnome.ProtonDrive">
+    <signal name="AccountAdded">
+      <arg name="username" type="s"/>
+    </signal>
+    <signal name="AccountRemoved">
+      <arg name="username" type="s"/>
+    </signal>
+  </interface>
+</node>
+'''
+_PROTON_DRIVE_OBJ_PATH  = '/org/gnome/ProtonDrive'
+_PROTON_DRIVE_IFACE     = 'org.gnome.ProtonDrive'
 
 import base64, hashlib, http.cookiejar, json, math, os, re, shutil
 import socket as _socket, struct, subprocess, tempfile, threading, time
@@ -299,6 +316,31 @@ def secret_store(label, username, field, value):
          'username', username, 'field', field],
         input=value.encode(), check=True,
     )
+
+
+def _emit_account_signal(signal_name, username):
+    """Emit AccountAdded/AccountRemoved on the session bus.
+
+    The volume monitor subscribes to these signals for an instant update;
+    it also watches libsecret independently as a fallback.  Failures here
+    are non-fatal — the monitor will catch the keyring change on its next
+    collection-changed notification.
+    """
+    try:
+        iface_info = Gio.DBusNodeInfo.new_for_xml(_PROTON_DRIVE_IFACE_XML).interfaces[0]
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        bus.register_object(_PROTON_DRIVE_OBJ_PATH, iface_info, None, None, None)
+        bus.emit_signal(
+            None,
+            _PROTON_DRIVE_OBJ_PATH,
+            _PROTON_DRIVE_IFACE,
+            signal_name,
+            GLib.Variant('(s)', (username,)),
+        )
+    except Exception as e:
+        print(f'[setup] D-Bus signal {signal_name} failed (non-fatal): {e}',
+              file=sys.stderr)
+
 
 # ---------- captcha window ----------
 
@@ -814,6 +856,7 @@ class SetupWindow(Gtk.ApplicationWindow):
             self._show_err(f'Failed to store credentials: {e}')
             return
 
+        _emit_account_signal('AccountAdded', u)
         self._cleanup()
         _show_info(self, 'Setup complete',
                    f'Signed in as {u}.\n\n'

@@ -1,0 +1,3 @@
+[RemoteVolumeMonitor]
+DBusName=org.gnome.GVfs.VolumeMonitor.Proton
+Exec=@libexecdir@/gvfsd-proton-volume-monitor

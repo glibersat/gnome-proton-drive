@@ -1,0 +1,2 @@
+option('gvfs-remote-volume-monitor-dir', type: 'string', value: '',
+  description: 'Directory where GVfs remote volume monitor descriptors are installed')

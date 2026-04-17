@@ -215,18 +215,27 @@ Implements `gvfsd-proton` in C (`backend/`):
   `query_info`, `enumerate`.
 - Write ops return `G_IO_ERROR_NOT_SUPPORTED` until B3 lands.
 
-### C2. Volume monitor
+### C2. Volume monitor ✅
 
-A `gvfsd-proton-volume-monitor` daemon that makes the drive appear in Nautilus:
+`gvfsd-proton-volume-monitor` — a Vala GVfs remote volume monitor daemon
+(`volume-monitor/`) that makes accounts appear automatically in Nautilus.
 
-- **Primary source (M1–M3):** watch libsecret for entries matching the
-  `org.gnome.proton.drive` schema, and listen on `org.gnome.ProtonDrive` D-Bus
-  for account-added/removed signals emitted by the setup wizard (A2).
+- **Account detection (dual path):**
+  - libsecret `CollectionChanged` D-Bus signal via `GDBusProxy.g-signal` —
+    catches keyring writes from any source (authoritative).
+  - `org.gnome.ProtonDrive.AccountAdded` signal from the setup wizard (A2) —
+    fast path, fires immediately after credentials are stored.
+  - An in-memory set deduplicates so each `volume_added` fires exactly once.
+- **Volume representation:** `ProtonVolume` serialises to the `a{sv}` dict
+  expected by `GProxyVolumeMonitor`: display name, `proton-drive-symbolic`
+  icon, stable UUID, `activation-uri = proton://<email>/`.
+- **D-Bus interface:** implements `org.gtk.vfs.RemoteVolumeMonitor` under bus
+  name `org.gnome.GVfs.VolumeMonitor.Proton`; descriptor at
+  `volume-monitor/proton.monitor.in`.
 - **Secondary source (M4+):** additionally watch `GoaClient` for GOA accounts
   with `provider_type=proton` once A3 lands.
-- On account detected: emit `volume-added` on `GVfsVolumeMonitor`, providing
-  icon (`proton-drive` symbolic), display name, and UUID from the account email.
-- On account removed: unmount and emit `volume-removed`.
+- `proton-drive-setup` now emits `AccountAdded` on `org.gnome.ProtonDrive`
+  immediately after writing credentials, triggering the fast path.
 
 ### C3. Two-way sync
 
@@ -298,7 +307,7 @@ overwrite. Revisit once revision history API is accessible.
 
 | Milestone | Tracks | Deliverable | Status |
 |---|---|---|---|
-| **M1 — Read-only mount** | A1 + A2 + B1 + C1 + C2 | Proton Drive visible in Nautilus; files openable read-only | In progress |
+| **M1 — Read-only mount** | A1 + A2 + B1 + C1 + C2 | Proton Drive visible in Nautilus; files openable read-only | ✅ Complete — volume monitor implemented; manual `gio mount` no longer required |
 | **M2 — Live updates** | B4 + C3 (remote→local) | Nautilus refreshes when remote changes | ✅ Core complete — volume-level polling, anchor persistence, diff-based CREATED/DELETED, trash detection all working. `HasMoreData` paging and move/rename distinction pending |
 | **M3 — Full read/write** | B3 + C1 (writes) + C3 | Create, edit, move, delete from Nautilus | Blocked on go-proton-api |
 | **M4 — Settings panel** | A3-a or A3-b | Proton Drive in GNOME Settings → Online Accounts | Not started |
