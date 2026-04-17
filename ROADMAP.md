@@ -132,11 +132,27 @@ layers on every tree walk:
   Fanning out `GetName` into goroutines (first-match via channel) cuts crypto
   time proportionally to directory width.
 
-### B2. Streaming block reads
+### B2. Streaming block reads ✅
 
-Current `ReadFile` buffers the entire file before applying offset/length.
-Replace with a streaming approach: fetch and decrypt blocks on demand, seeking
-by skipping blocks whose byte range falls entirely before `offset`.
+`ReadFile` now fetches and decrypts only the blocks that overlap the requested
+`[offset, offset+length)` range instead of buffering the entire file:
+
+- **Per-block `BlockCache`** — cache entries keyed by `(linkID, revisionID, blockIndex)`
+  at `<root>/<linkID>/<revisionID>/<index>`.  The old whole-file format is
+  migrated transparently: if `PutBlock` finds a plain file at the revision path,
+  it removes it before creating the per-block directory.  LRU eviction and
+  `InvalidateLink` work unchanged (the walk covers any depth).
+- **`GetRevision(fromBlock=startBlock+1)`** — the API is 1-indexed; `startBlock`
+  is derived as `offset / 4 MiB`.  Only blocks from `startBlock` onward are
+  requested, so blocks before the read window are never downloaded.
+- **Per-block cache hits** — each block is checked in `GetBlock` before any
+  network call; a hit is served directly.  Each fetched block is stored with
+  `PutBlock` so subsequent overlapping reads are served from disk.
+- **Offline fallback** — if `GetRevision` fails offline, the block count is
+  derived from `link.Size` and the range is served from cached blocks alone;
+  `ErrOffline` is returned only if a required block is absent.
+- **`main.go` wiring** — `p.Offset` and `p.Length` are passed directly to
+  `ReadFileContent`; the post-hoc byte slicing that existed there is removed.
 
 ### B3. Write operations
 

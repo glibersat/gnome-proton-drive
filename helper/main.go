@@ -276,7 +276,7 @@ func main() {
 			return nil, &rpc.RPCError{Code: rpc.ErrInvalidArg, Message: "not a file"}
 		}
 
-		data, err := s.ReadFileContent(ctx, link, parentKR)
+		data, err := s.ReadFileContent(ctx, link, parentKR, p.Offset, p.Length)
 		if err != nil {
 			if errors.Is(err, drive.ErrOffline) {
 				return nil, rpc.Offline("network unreachable and file not in cache")
@@ -284,16 +284,7 @@ func main() {
 			return nil, err
 		}
 
-		if p.Offset > int64(len(data)) {
-			p.Offset = int64(len(data))
-		}
-		data = data[p.Offset:]
-		eof := true
-		if p.Length > 0 && p.Length < int64(len(data)) {
-			data = data[:p.Length]
-			eof = false
-		}
-
+		eof := p.Length == 0 || int64(len(data)) < p.Length
 		return rpc.ReadResult{Data: data, EOF: eof}, nil
 	})
 

@@ -178,9 +178,9 @@ one JSON object terminated by `\n`.
 | Authentication + key unlock | ✅ |
 | List directory | ✅ |
 | Stat file/directory | ✅ |
-| Read file (decrypted) | ✅ |
+| Read file (streaming, offset-aware, decrypted) | ✅ |
 | Metadata cache (event-invalidated, offline fallback) | ✅ |
-| Block cache (persistent, 2 GiB LRU, offline reads) | ✅ |
+| Block cache (per-block, persistent, 2 GiB LRU, offline reads) | ✅ |
 | GVfs C backend (read-only) | ✅ |
 | Delete / trash | ✅ (helper only — not exposed via GVfs yet) |
 | Create directory | ⏳ Pending crypto helpers in go-proton-api |
@@ -203,8 +203,5 @@ one JSON object terminated by `\n`.
 - **Block cache stores plaintext.** Decrypted file content is written to
   `~/.cache/proton-drive/` without re-encryption. Rely on OS full-disk
   encryption until this is addressed.
-- **`ReadFile` buffers the entire file.** The full block set is decrypted
-  before slicing to the requested window. Streaming decryption (ROADMAP §B2)
-  is needed for large files.
 - **Session token TTL unknown.** Re-authentication UX (silent refresh vs.
   re-prompt dialog) is not yet determined.

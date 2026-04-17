@@ -359,26 +359,31 @@ func (s *Session) GetBlock(ctx context.Context, url, token string) ([]byte, erro
 	return io.ReadAll(rc)
 }
 
-// ReadFileContent returns the fully decrypted content of a file link.
+// protonBlockSize is the nominal plaintext size of each encrypted block.
+// Blocks are 4 MiB except the last block of a file, which may be smaller.
+// The Proton Drive API does not expose per-block plaintext sizes in download
+// responses, so we rely on this constant when computing block indices from
+// byte offsets.
+const protonBlockSize = 4 * 1024 * 1024
+
+// ReadFileContent returns decrypted file bytes in [offset, offset+length).
 //
-// The block cache is consulted first: on a hit the bytes are returned without
-// touching the network.  On a miss the revision is fetched from the API, each
-// encrypted block is decrypted with the session key, the result is stored in
-// the block cache, and the plaintext is returned.
+// offset and length follow the same semantics as io.ReaderAt: offset is the
+// byte position within the file, length 0 means "to EOF".  The caller is
+// responsible for ensuring offset ≤ link.Size.
 //
-// On API failure ErrOffline is returned so that callers can map it to the
-// appropriate RPC error code.
-func (s *Session) ReadFileContent(ctx context.Context, link proton.Link, parentKR *crypto.KeyRing) ([]byte, error) {
+// Block fetching starts at the block that contains offset, so only the blocks
+// overlapping the requested range are downloaded and decrypted.  Each fetched
+// block is stored individually in the block cache; subsequent reads of
+// overlapping or adjacent ranges benefit from cached blocks.
+//
+// Offline fallback: if the API is unreachable the method attempts to serve the
+// requested range entirely from cached blocks, deriving the block count from
+// link.Size.  If any required block is absent from the cache, ErrOffline is
+// returned.
+func (s *Session) ReadFileContent(ctx context.Context, link proton.Link, parentKR *crypto.KeyRing, offset, length int64) ([]byte, error) {
 	linkID := link.LinkID
 	revID := link.FileProperties.ActiveRevision.ID
-
-	if s.blocks != nil {
-		if data, ok := s.blocks.Get(linkID, revID); ok {
-			log.Printf("cache hit  block %s rev %s (%d bytes)", linkID, revID, len(data))
-			return data, nil
-		}
-		log.Printf("cache miss block %s rev %s", linkID, revID)
-	}
 
 	nodeKR, err := link.GetKeyRing(parentKR, s.addrKR)
 	if err != nil {
@@ -389,16 +394,31 @@ func (s *Session) ReadFileContent(ctx context.Context, link proton.Link, parentK
 		return nil, err
 	}
 
-	rev, err := s.GetRevision(ctx, linkID, revID, 1, 100)
+	// startBlock0 is the 0-based index of the first block that contains offset.
+	startBlock0 := int(offset / protonBlockSize)
+	// The API uses 1-based FromBlockIndex.
+	apiFromBlock := startBlock0 + 1
+
+	rev, err := s.GetRevision(ctx, linkID, revID, apiFromBlock, 500)
 	if err != nil {
-		if isOfflineError(err) {
-			return nil, ErrOffline
+		if !isOfflineError(err) {
+			return nil, err
 		}
-		return nil, err
+		// Offline: try to serve the range from per-block cache alone.
+		return s.readFromCache(linkID, revID, link.Size, offset, length)
 	}
 
-	var data []byte
+	var buf []byte
 	for _, block := range rev.Blocks {
+		// block.Index is 1-based; convert to 0-based for the cache key.
+		idx := block.Index - 1
+		if s.blocks != nil {
+			if cached, ok := s.blocks.GetBlock(linkID, revID, idx); ok {
+				log.Printf("cache hit  block %s rev %s idx %d (%d bytes)", linkID, revID, idx, len(cached))
+				buf = append(buf, cached...)
+				continue
+			}
+		}
 		enc, err := s.GetBlock(ctx, block.BareURL, block.Token)
 		if err != nil {
 			if isOfflineError(err) {
@@ -410,17 +430,62 @@ func (s *Session) ReadFileContent(ctx context.Context, link proton.Link, parentK
 		if err != nil {
 			return nil, err
 		}
-		data = append(data, plain.GetBinary()...)
+		plainBytes := plain.GetBinary()
+		if s.blocks != nil {
+			if err := s.blocks.PutBlock(linkID, revID, idx, plainBytes); err != nil {
+				log.Printf("cache store block %s rev %s idx %d: %v", linkID, revID, idx, err)
+			} else {
+				log.Printf("cache store block %s rev %s idx %d (%d bytes)", linkID, revID, idx, len(plainBytes))
+			}
+		}
+		buf = append(buf, plainBytes...)
 	}
 
-	if s.blocks != nil {
-		if err := s.blocks.Put(linkID, revID, data); err != nil {
-			log.Printf("cache store block %s rev %s: %v", linkID, revID, err)
-		} else {
-			log.Printf("cache store block %s rev %s (%d bytes)", linkID, revID, len(data))
-		}
+	return sliceRange(buf, startBlock0, offset, length), nil
+}
+
+// readFromCache serves [offset, offset+length) from per-block cache entries,
+// deriving the expected block count from fileSize.  Returns ErrOffline if any
+// required block is absent.
+func (s *Session) readFromCache(linkID, revID string, fileSize, offset, length int64) ([]byte, error) {
+	if s.blocks == nil {
+		return nil, ErrOffline
 	}
-	return data, nil
+	startBlock0 := int(offset / protonBlockSize)
+	endByte := fileSize
+	if length > 0 && offset+length < endByte {
+		endByte = offset + length
+	}
+	endBlock0 := int((endByte - 1) / protonBlockSize)
+
+	var buf []byte
+	for idx := startBlock0; idx <= endBlock0; idx++ {
+		data, ok := s.blocks.GetBlock(linkID, revID, idx)
+		if !ok {
+			log.Printf("offline cache miss block %s rev %s idx %d", linkID, revID, idx)
+			return nil, ErrOffline
+		}
+		buf = append(buf, data...)
+	}
+	return sliceRange(buf, startBlock0, offset, length), nil
+}
+
+// sliceRange trims buf (which starts at the beginning of startBlock0) to the
+// byte range [offset, offset+length).  length 0 means keep everything.
+func sliceRange(buf []byte, startBlock0 int, offset, length int64) []byte {
+	blockStartByte := int64(startBlock0) * protonBlockSize
+	trimStart := offset - blockStartByte
+	if trimStart < 0 {
+		trimStart = 0
+	}
+	if trimStart >= int64(len(buf)) {
+		return nil
+	}
+	buf = buf[trimStart:]
+	if length > 0 && length < int64(len(buf)) {
+		buf = buf[:length]
+	}
+	return buf
 }
 
 // MakeDir creates a folder at the given path.
