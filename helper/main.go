@@ -15,6 +15,26 @@ import (
 	"github.com/glibersat/gnome-proton/helper/rpc"
 )
 
+// linkToEntry converts a proton.Link to an rpc.Entry. For files, mtime is the
+// revision creation time — stable across metadata changes, changing only when
+// content changes. For directories, link.ModifyTime is used as-is.
+func linkToEntry(l proton.Link, name string) rpc.Entry {
+	mtime := l.ModifyTime
+	var revID string
+	if l.FileProperties != nil {
+		revID = l.FileProperties.ActiveRevision.ID
+		mtime = l.FileProperties.ActiveRevision.CreateTime
+	}
+	return rpc.Entry{
+		Name:       name,
+		IsDir:      l.Type == proton.LinkTypeFolder,
+		Size:       l.Size,
+		MTime:      mtime,
+		LinkID:     l.LinkID,
+		RevisionID: revID,
+	}
+}
+
 func main() {
 	socketPath := flag.String("socket", "", "unix socket path")
 	flag.Parse()
@@ -212,18 +232,7 @@ func main() {
 				continue
 			}
 			log.Printf("  entry %q type=%d dir=%v size=%d", name, l.Type, l.Type == proton.LinkTypeFolder, l.Size)
-			var revID string
-			if l.FileProperties != nil {
-				revID = l.FileProperties.ActiveRevision.ID
-			}
-			result.Entries = append(result.Entries, rpc.Entry{
-				Name:       name,
-				IsDir:      l.Type == proton.LinkTypeFolder,
-				Size:       l.Size,
-				MTime:      l.ModifyTime,
-				LinkID:     l.LinkID,
-				RevisionID: revID,
-			})
+			result.Entries = append(result.Entries, linkToEntry(l, name))
 		}
 		return result, nil
 	})
@@ -244,18 +253,7 @@ func main() {
 		}
 
 		name, _ := link.GetName(parentKR, s.AddrKR())
-		var revID string
-		if link.FileProperties != nil {
-			revID = link.FileProperties.ActiveRevision.ID
-		}
-		return rpc.Entry{
-			Name:       name,
-			IsDir:      link.Type == proton.LinkTypeFolder,
-			Size:       link.Size,
-			MTime:      link.ModifyTime,
-			LinkID:     link.LinkID,
-			RevisionID: revID,
-		}, nil
+		return linkToEntry(link, name), nil
 	})
 
 	srv.Register("ReadFile", func(ctx context.Context, raw json.RawMessage) (any, error) {
