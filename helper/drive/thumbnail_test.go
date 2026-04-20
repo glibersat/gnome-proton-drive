@@ -69,6 +69,21 @@ func TestFetchThumbnail_NoThumbnailsInRevision(t *testing.T) {
 	if got != "" {
 		t.Errorf("expected empty path for no-thumbnail revision, got %q", got)
 	}
+
+	// Negative-cache sentinel must exist as a zero-byte file so a second call
+	// skips the network entirely.
+	sentinel := s.thumbnailCachePath("link1", "rev1")
+	if info, err := os.Stat(sentinel); err != nil {
+		t.Errorf("negative-cache sentinel not written: %v", err)
+	} else if info.Size() != 0 {
+		t.Errorf("sentinel must be zero bytes, got %d", info.Size())
+	}
+
+	// Second call must return "" without hitting the (now-closed) server.
+	got2, err := s.FetchThumbnail(context.Background(), "link1", "rev1")
+	if err != nil || got2 != "" {
+		t.Errorf("second call after sentinel: path=%q err=%v", got2, err)
+	}
 }
 
 func TestFetchThumbnail_FullFlow(t *testing.T) {

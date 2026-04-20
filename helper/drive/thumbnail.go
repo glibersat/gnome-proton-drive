@@ -46,7 +46,12 @@ func (s *Session) FetchThumbnail(ctx context.Context, linkID, revisionID string)
 	thumbPath := s.thumbnailCachePath(linkID, revisionID)
 
 	// Fast path: already cached on disk.
-	if info, err := os.Stat(thumbPath); err == nil && info.Size() > 0 {
+	// A zero-byte file is a negative-cache sentinel: the revision was checked
+	// and has no thumbnail, so skip the network round-trip.
+	if info, err := os.Stat(thumbPath); err == nil {
+		if info.Size() == 0 {
+			return "", nil
+		}
 		now := time.Now()
 		_ = os.Chtimes(thumbPath, now, now)
 		log.Printf("thumbnail cache hit  %s", linkID)
@@ -63,6 +68,8 @@ func (s *Session) FetchThumbnail(ctx context.Context, linkID, revisionID string)
 		return "", fmt.Errorf("thumbnail fetch: revision IDs: %w", err)
 	}
 	if len(ids) == 0 {
+		// Cache the negative result so subsequent calls are a fast disk hit.
+		_ = writeThumbnailCache(thumbPath, []byte{})
 		return "", nil
 	}
 

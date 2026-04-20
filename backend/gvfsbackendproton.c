@@ -506,7 +506,7 @@ do_query_info (GVfsBackend           *backend,
    * has one.  The helper caches the image on disk; subsequent calls are fast
    * (disk-only).  We skip this for directories and when the revision ID is
    * absent (should not happen for active revisions). */
-  if (e->has_thumbnail && e->link_id && e->revision_id &&
+  if (!e->is_dir && e->link_id && e->revision_id &&
       g_file_attribute_matcher_matches (matcher, G_FILE_ATTRIBUTE_THUMBNAIL_PATH))
     {
       gchar *thumb_path = proton_rpc_fetch_thumbnail (self->rpc,
