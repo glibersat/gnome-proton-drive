@@ -102,12 +102,13 @@ type ListDirResult struct {
 type StatParams struct{ Path string `json:"path"` }
 
 type Entry struct {
-	Name       string `json:"name"`
-	IsDir      bool   `json:"is_dir"`
-	Size       int64  `json:"size"`
-	MTime      int64  `json:"mtime"`
-	LinkID     string `json:"link_id"`
-	RevisionID string `json:"revision_id,omitempty"` // files only
+	Name         string `json:"name"`
+	IsDir        bool   `json:"is_dir"`
+	Size         int64  `json:"size"`
+	MTime        int64  `json:"mtime"`
+	LinkID       string `json:"link_id"`
+	RevisionID   string `json:"revision_id,omitempty"`   // files only
+	HasThumbnail bool   `json:"has_thumbnail,omitempty"` // true if server has a thumbnail for this revision
 }
 
 type ReadParams struct {
@@ -141,6 +142,20 @@ type Event struct {
 	Type   string `json:"type"`    // "changed" | "deleted" | "created"
 	LinkID string `json:"link_id"`
 	Path   string `json:"path,omitempty"`
+}
+
+// FetchThumbnailParams requests the local path of a server-side thumbnail.
+// The helper downloads the thumbnail on first call and caches it on disk;
+// subsequent calls return the cached path immediately.
+type FetchThumbnailParams struct {
+	LinkID     string `json:"link_id"`
+	RevisionID string `json:"revision_id"`
+}
+
+// FetchThumbnailResult contains the local filesystem path to the cached
+// thumbnail image.  Path is empty when the revision has no thumbnail.
+type FetchThumbnailResult struct {
+	Path string `json:"path"`
 }
 
 type MkdirParams struct{ Path string `json:"path"` }
