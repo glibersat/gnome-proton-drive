@@ -24,6 +24,9 @@ proton-drive-helper (Go)
    ├── BlockCache (~/.cache/proton-drive/<account>/blocks/)
    │     Decrypted file content, keyed by (linkID, revisionID)
    │
+   ├── ThumbnailCache (~/.cache/proton-drive/<account>/thumbnails/)
+   │     Server-generated thumbnails, keyed by (linkID, revisionID)
+   │
    └── Proton API (network)
 ```
 
@@ -165,9 +168,12 @@ No other code changes are required.
 ```
 ~/.cache/proton-drive/
 └── user%40proton.me/           ← URL-path-escaped account email
-    └── blocks/
+    ├── blocks/
+    │   └── <linkID>/
+    │       └── <revisionID>    ← raw decrypted bytes
+    └── thumbnails/
         └── <linkID>/
-            └── <revisionID>    ← raw decrypted bytes
+            └── <revisionID>    ← raw thumbnail bytes (JPEG/WebP)
 ```
 
 Each file contains the complete decrypted content of one file revision.
