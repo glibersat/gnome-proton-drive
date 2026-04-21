@@ -20,9 +20,10 @@ proton-drive-setup  (Python GTK wizard)
 gvfsd-proton  (C, GVfs backend)
         ↕ Unix socket — line-delimited JSON-RPC
 proton-drive-helper  (Go binary)
-        ├── EventPoller (volume events, 30 s poll)
-        ├── MetaCache   (in-memory, event-invalidated)
-        ├── BlockCache  (~/.cache/proton-drive/)
+        ├── EventPoller     (volume events, 30 s poll)
+        ├── MetaCache       (in-memory, event-invalidated)
+        ├── BlockCache      (~/.cache/proton-drive/…/blocks/)
+        ├── ThumbnailCache  (~/.cache/proton-drive/…/thumbnails/)
         └── ↕ HTTPS + E2E encryption
 Proton Drive API
 ```
@@ -175,6 +176,7 @@ one JSON object terminated by `\n`.
 | `ListDir` | `{path}` | List active children of a directory |
 | `Stat` | `{path}` | Get metadata for a file or directory |
 | `ReadFile` | `{path, offset, length}` | Read file content (decrypted) |
+| `FetchThumbnail` | `{link_id, revision_id}` | Fetch and cache a server-side thumbnail; returns local path |
 | `Mkdir` | `{path}` | Create a directory *(blocked — see limitations)* |
 | `Delete` | `{path, trash}` | Delete or trash a file/directory |
 | `Move` | `{src, dst}` | Move or rename *(blocked — see limitations)* |
@@ -201,6 +203,7 @@ one JSON object terminated by `\n`.
 | Read file (streaming, offset-aware, decrypted) | ✅ |
 | Metadata cache (event-invalidated, offline fallback) | ✅ |
 | Block cache (per-block, persistent, 2 GiB LRU, offline reads) | ✅ |
+| Thumbnails (server-side, cached, shown in Nautilus) | ✅ |
 | GVfs C backend (read-only) | ✅ |
 | Delete / trash | ✅ (helper only — not exposed via GVfs yet) |
 | Create directory | ⏳ Pending crypto helpers in go-proton-api |

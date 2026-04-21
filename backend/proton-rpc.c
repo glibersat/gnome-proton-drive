@@ -291,6 +291,8 @@ proton_rpc_list_dir (ProtonRpc    *rpc,
         ent->link_id = g_strdup (json_object_get_string_member (e, "link_id"));
       if (json_object_has_member (e, "revision_id"))
         ent->revision_id = g_strdup (json_object_get_string_member (e, "revision_id"));
+      if (json_object_has_member (e, "has_thumbnail"))
+        ent->has_thumbnail = json_object_get_boolean_member (e, "has_thumbnail");
       entries[i]  = ent;
     }
 
@@ -323,6 +325,8 @@ proton_rpc_stat (ProtonRpc    *rpc,
     ent->link_id = g_strdup (json_object_get_string_member (e, "link_id"));
   if (json_object_has_member (e, "revision_id"))
     ent->revision_id = g_strdup (json_object_get_string_member (e, "revision_id"));
+  if (json_object_has_member (e, "has_thumbnail"))
+    ent->has_thumbnail = json_object_get_boolean_member (e, "has_thumbnail");
   return ent;
 }
 
@@ -363,6 +367,33 @@ proton_rpc_read_file (ProtonRpc    *rpc,
   memcpy (buf, data, n);
   g_free (data);
   return n;
+}
+
+gchar *
+proton_rpc_fetch_thumbnail (ProtonRpc    *rpc,
+                             const gchar  *link_id,
+                             const gchar  *revision_id,
+                             GCancellable *cancellable,
+                             GError      **error)
+{
+  g_autoptr(JsonBuilder) b = json_builder_new ();
+  json_builder_begin_object (b);
+  json_builder_set_member_name (b, "link_id");
+  json_builder_add_string_value (b, link_id);
+  json_builder_set_member_name (b, "revision_id");
+  json_builder_add_string_value (b, revision_id);
+  json_builder_end_object (b);
+
+  g_autoptr(JsonObject) resp = call (rpc, "FetchThumbnail", b, cancellable, error);
+  if (!resp)
+    return NULL;
+
+  JsonObject  *result = json_object_get_object_member (resp, "result");
+  const gchar *path   = json_object_get_string_member (result, "path");
+  if (!path || *path == '\0')
+    return NULL;
+
+  return g_strdup (path);
 }
 
 void

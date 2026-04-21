@@ -11,6 +11,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	proton "github.com/ProtonMail/go-proton-api"
 	"github.com/ProtonMail/gluon/async"
@@ -25,12 +26,23 @@ import (
 // (persistent on-disk), and an EventPoller that polls the share event stream
 // and invalidates stale cache entries as changes arrive.
 // See metacache.go, blockcache.go, and events.go for details.
+// authState holds the rolling access credentials used for raw HTTP calls
+// (e.g. thumbnail endpoint) that bypass go-proton-api's request machinery.
+type authState struct {
+	mu      sync.RWMutex
+	uid     string
+	bearer  string // access token, updated on every 401-refresh
+}
+
 type Session struct {
-	client   *proton.Client
-	shareID  string
-	volumeID string                    // volume that owns the main share (for volume-level events)
-	rootID   string
-	account  string                     // email address — scopes the block cache directory
+	client    *proton.Client
+	shareID   string
+	volumeID  string   // volume that owns the main share (for volume-level events)
+	rootID    string
+	account   string   // email address — scopes the block cache directory
+	cacheBase string   // overrides blockCacheBase(account) when set (used in tests)
+	apiBase   string   // Proton API base URL, e.g. https://mail.proton.me/api
+	auth      authState // rolling access token captured from the proton client
 	addrKR   *crypto.KeyRing            // primary address keyring
 	shareKR  *crypto.KeyRing            // share keyring (unlocked with addrKR)
 	nodeKRs   map[string]*crypto.KeyRing // linkID → decrypted node keyring (cache)
@@ -39,6 +51,26 @@ type Session struct {
 	meta     *MetaCache                 // short-lived metadata cache
 	blocks   *BlockCache                // persistent block cache (nil if unavailable)
 	poller   *EventPoller               // background share-event poller
+}
+
+// currentAuth returns a snapshot of the latest access credentials.
+func (s *Session) currentAuth() (uid, bearer string) {
+	s.auth.mu.RLock()
+	defer s.auth.mu.RUnlock()
+	return s.auth.uid, s.auth.bearer
+}
+
+// setAuth stores updated access credentials. Called at session creation and
+// whenever go-proton-api refreshes the access token after a 401.
+func (s *Session) setAuth(uid, accessToken string) {
+	s.auth.mu.Lock()
+	defer s.auth.mu.Unlock()
+	if uid != "" {
+		s.auth.uid = uid
+	}
+	if accessToken != "" {
+		s.auth.bearer = accessToken
+	}
 }
 
 // HVRequiredError is returned by NewSession when Proton requires a CAPTCHA.
@@ -94,7 +126,9 @@ func NewSession(ctx context.Context, mgr *proton.Manager, username, password str
 		RefreshToken:     auth.RefreshToken,
 		SaltedPassphrase: saltedPass,
 	}
-	return newSession(c, shareID, volumeID, rootID, username, addrKR), creds, nil
+	s := newSession(c, shareID, volumeID, rootID, username, addrKR)
+	s.setAuth(auth.UID, auth.AccessToken)
+	return s, creds, nil
 }
 
 // NewSessionWithHV retries SRP login after the user completes a human
@@ -127,7 +161,9 @@ func NewSessionWithHV(ctx context.Context, mgr *proton.Manager, username, passwo
 		RefreshToken:     auth.RefreshToken,
 		SaltedPassphrase: saltedPass,
 	}
-	return newSession(c, shareID, volumeID, rootID, username, addrKR), creds, nil
+	s := newSession(c, shareID, volumeID, rootID, username, addrKR)
+	s.setAuth(auth.UID, auth.AccessToken)
+	return s, creds, nil
 }
 
 // ResumeSession restores a fully authenticated session from the three values
@@ -161,7 +197,9 @@ func ResumeSession(ctx context.Context, mgr *proton.Manager, creds SessionCreden
 		RefreshToken:     auth.RefreshToken,
 		SaltedPassphrase: creds.SaltedPassphrase,
 	}
-	return newSession(c, shareID, volumeID, rootID, account, addrKR), newCreds, nil
+	s := newSession(c, shareID, volumeID, rootID, account, addrKR)
+	s.setAuth(auth.UID, auth.AccessToken)
+	return s, newCreds, nil
 }
 
 // newSession is the single place where Session is constructed.  It
@@ -174,12 +212,21 @@ func newSession(c *proton.Client, shareID, volumeID, rootID, account string, add
 		volumeID:  volumeID,
 		rootID:    rootID,
 		account:   account,
+		apiBase:   proton.DefaultHostURL,
 		addrKR:    addrKR,
 		nodeKRs:   make(map[string]*crypto.KeyRing),
 		linkPaths: make(map[string]string),
 		pathLinks: make(map[string]string),
 		meta:      NewMetaCache(0),
 	}
+
+	// Keep rolling auth credentials in sync with the client.
+	// AddAuthHandler fires whenever go-proton-api refreshes the access token
+	// after a 401, ensuring thumbnail API calls always use a fresh token.
+	c.AddAuthHandler(func(a proton.Auth) {
+		s.setAuth(a.UID, a.AccessToken)
+	})
+
 	base, err := blockCacheBase(account)
 	if err != nil {
 		log.Printf("block cache disabled: %v", err)
@@ -201,6 +248,16 @@ func newSession(c *proton.Client, shareID, volumeID, rootID, account string, add
 func (s *Session) StartPoller(ctx context.Context) {
 	s.poller = newEventPoller(s, 0)
 	s.poller.Start(ctx)
+}
+
+// cacheBaseFor returns the account-scoped base directory for all caches.
+// If the session has a cacheBase override (set in tests), it is used directly.
+// Otherwise the directory is derived from the OS user cache dir.
+func (s *Session) cacheBaseFor() (string, error) {
+	if s.cacheBase != "" {
+		return s.cacheBase, nil
+	}
+	return blockCacheBase(s.account)
 }
 
 // blockCacheBase returns the account-scoped base directory for the block cache.

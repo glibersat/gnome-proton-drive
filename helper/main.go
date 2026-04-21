@@ -24,19 +24,23 @@ func linkToEntry(l proton.Link, name string) rpc.Entry {
 		mtime = l.CreateTime
 	}
 	var revID string
+	var hasThumb bool
 	if l.FileProperties != nil {
-		revID = l.FileProperties.ActiveRevision.ID
-		if l.FileProperties.ActiveRevision.CreateTime != 0 {
-			mtime = l.FileProperties.ActiveRevision.CreateTime
+		rev := l.FileProperties.ActiveRevision
+		revID = rev.ID
+		if rev.CreateTime != 0 {
+			mtime = rev.CreateTime
 		}
+		hasThumb = bool(rev.Thumbnail)
 	}
 	return rpc.Entry{
-		Name:       name,
-		IsDir:      l.Type == proton.LinkTypeFolder,
-		Size:       l.Size,
-		MTime:      mtime,
-		LinkID:     l.LinkID,
-		RevisionID: revID,
+		Name:         name,
+		IsDir:        l.Type == proton.LinkTypeFolder,
+		Size:         l.Size,
+		MTime:        mtime,
+		LinkID:       l.LinkID,
+		RevisionID:   revID,
+		HasThumbnail: hasThumb,
 	}
 }
 
@@ -289,6 +293,28 @@ func main() {
 
 		eof := p.Length == 0 || int64(len(data)) < p.Length
 		return rpc.ReadResult{Data: data, EOF: eof}, nil
+	})
+
+	// FetchThumbnail downloads (if needed) and caches the server-side thumbnail
+	// for a file revision.  Returns the local path to the cached image, or an
+	// empty path when no thumbnail is available.  The C backend sets
+	// G_FILE_ATTRIBUTE_THUMBNAIL_PATH to this path for Nautilus.
+	srv.Register("FetchThumbnail", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		s, err := requireSession()
+		if err != nil {
+			return nil, err
+		}
+		var p rpc.FetchThumbnailParams
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, &rpc.RPCError{Code: rpc.ErrInvalidArg, Message: err.Error()}
+		}
+		thumbPath, err := s.FetchThumbnail(ctx, p.LinkID, p.RevisionID)
+		if err != nil {
+			log.Printf("FetchThumbnail %s: %v", p.LinkID, err)
+			// Non-fatal: return empty path so the C backend falls back gracefully.
+			return rpc.FetchThumbnailResult{}, nil
+		}
+		return rpc.FetchThumbnailResult{Path: thumbPath}, nil
 	})
 
 	srv.Register("Mkdir", func(ctx context.Context, raw json.RawMessage) (any, error) {
