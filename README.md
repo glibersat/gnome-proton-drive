@@ -1,5 +1,9 @@
 # Gnome Proton Drive
 
+> **Unofficial project.** This is not affiliated with or endorsed by Proton AG.
+> It exists out of personal frustration waiting for an official Linux client —
+> use it at your own risk.
+
 > **Alpha — read-only.** This project is in early development. Only browsing
 > and opening files is supported; no writes, moves, or deletes are exposed to
 > the file manager yet. Expect rough edges and breaking changes between
