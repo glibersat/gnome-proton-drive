@@ -290,6 +290,78 @@ test_not_found (void)
   mock_server_stop (srv);
 }
 
+static void
+test_make_directory_success (void)
+{
+  const gchar *responses[] = {
+    "{\"id\":1,\"result\":null}"
+  };
+  MockServer *srv = mock_server_start (responses, G_N_ELEMENTS (responses));
+
+  GError    *error = NULL;
+  ProtonRpc *rpc   = proton_rpc_new (srv->socket_path, &error);
+  g_assert_nonnull (rpc);
+
+  gboolean ok = proton_rpc_make_directory (rpc, "/NewFolder", NULL, &error);
+  g_assert_no_error (error);
+  g_assert_true (ok);
+
+  proton_rpc_free (rpc);
+  mock_server_stop (srv);
+}
+
+static void
+test_make_directory_already_exists (void)
+{
+  const gchar *responses[] = {
+    "{\"id\":1,\"error\":{\"code\":-32006,\"message\":\"already exists\"}}"
+  };
+  MockServer *srv = mock_server_start (responses, G_N_ELEMENTS (responses));
+
+  GError    *error = NULL;
+  ProtonRpc *rpc   = proton_rpc_new (srv->socket_path, &error);
+  g_assert_nonnull (rpc);
+
+  gboolean ok = proton_rpc_make_directory (rpc, "/Existing", NULL, &error);
+  g_assert_false (ok);
+  g_assert_nonnull (error);
+  g_assert_error (error, G_IO_ERROR, G_IO_ERROR_EXISTS);
+  g_error_free (error);
+
+  proton_rpc_free (rpc);
+  mock_server_stop (srv);
+}
+
+static void
+test_error_code_mapping (void)
+{
+  /* Verify that each known RPC error code maps to the right GIOError. */
+  struct { const gchar *resp; GIOErrorEnum expected; } cases[] = {
+    { "{\"id\":1,\"error\":{\"code\":-32001,\"message\":\"x\"}}", G_IO_ERROR_NOT_FOUND },
+    { "{\"id\":1,\"error\":{\"code\":-32005,\"message\":\"x\"}}", G_IO_ERROR_HOST_UNREACHABLE },
+    { "{\"id\":1,\"error\":{\"code\":-32006,\"message\":\"x\"}}", G_IO_ERROR_EXISTS },
+    { "{\"id\":1,\"error\":{\"code\":-99999,\"message\":\"x\"}}", G_IO_ERROR_FAILED },
+  };
+
+  for (gsize i = 0; i < G_N_ELEMENTS (cases); i++)
+    {
+      const gchar *responses[] = { cases[i].resp };
+      MockServer *srv = mock_server_start (responses, 1);
+
+      GError    *error = NULL;
+      ProtonRpc *rpc   = proton_rpc_new (srv->socket_path, &error);
+      g_assert_nonnull (rpc);
+
+      proton_rpc_make_directory (rpc, "/x", NULL, &error);
+      g_assert_nonnull (error);
+      g_assert_cmpint (error->code, ==, cases[i].expected);
+      g_error_free (error);
+
+      proton_rpc_free (rpc);
+      mock_server_stop (srv);
+    }
+}
+
 /* ---------- main ---------- */
 
 int
@@ -297,13 +369,16 @@ main (int argc, char **argv)
 {
   g_test_init (&argc, &argv, NULL);
 
-  g_test_add_func ("/proton-rpc/auth-success",    test_auth_success);
-  g_test_add_func ("/proton-rpc/auth-failure",    test_auth_failure);
-  g_test_add_func ("/proton-rpc/resume-session",  test_resume_session);
-  g_test_add_func ("/proton-rpc/list-dir",        test_list_dir);
-  g_test_add_func ("/proton-rpc/stat",            test_stat);
-  g_test_add_func ("/proton-rpc/read-file",       test_read_file);
-  g_test_add_func ("/proton-rpc/not-found",       test_not_found);
+  g_test_add_func ("/proton-rpc/auth-success",               test_auth_success);
+  g_test_add_func ("/proton-rpc/auth-failure",               test_auth_failure);
+  g_test_add_func ("/proton-rpc/resume-session",             test_resume_session);
+  g_test_add_func ("/proton-rpc/list-dir",                   test_list_dir);
+  g_test_add_func ("/proton-rpc/stat",                       test_stat);
+  g_test_add_func ("/proton-rpc/read-file",                  test_read_file);
+  g_test_add_func ("/proton-rpc/not-found",                  test_not_found);
+  g_test_add_func ("/proton-rpc/make-directory-success",     test_make_directory_success);
+  g_test_add_func ("/proton-rpc/make-directory-exists",      test_make_directory_already_exists);
+  g_test_add_func ("/proton-rpc/error-code-mapping",         test_error_code_mapping);
 
   return g_test_run ();
 }

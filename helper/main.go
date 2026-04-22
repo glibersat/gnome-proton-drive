@@ -326,7 +326,13 @@ func main() {
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, &rpc.RPCError{Code: rpc.ErrInvalidArg, Message: err.Error()}
 		}
-		return nil, s.MakeDir(ctx, p.Path)
+		if err := s.MakeDir(ctx, p.Path); err != nil {
+			if errors.Is(err, drive.ErrAlreadyExists) {
+				return nil, &rpc.RPCError{Code: rpc.ErrAlreadyExists, Message: err.Error()}
+			}
+			return nil, err
+		}
+		return nil, nil
 	})
 
 	srv.Register("Delete", func(ctx context.Context, raw json.RawMessage) (any, error) {

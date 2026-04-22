@@ -2,6 +2,11 @@ package drive
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -43,7 +48,8 @@ type Session struct {
 	cacheBase string   // overrides blockCacheBase(account) when set (used in tests)
 	apiBase   string   // Proton API base URL, e.g. https://mail.proton.me/api
 	auth      authState // rolling access token captured from the proton client
-	addrKR   *crypto.KeyRing            // primary address keyring
+	addrKR    *crypto.KeyRing            // primary address keyring
+	addrEmail string                     // email of the primary address (used as SignatureAddress)
 	shareKR  *crypto.KeyRing            // share keyring (unlocked with addrKR)
 	nodeKRs   map[string]*crypto.KeyRing // linkID → decrypted node keyring (cache)
 	linkPaths map[string]string          // linkID → absolute path (reverse map for event resolution)
@@ -109,7 +115,7 @@ func NewSession(ctx context.Context, mgr *proton.Manager, username, password str
 		return nil, SessionCredentials{}, err
 	}
 
-	addrKR, saltedPass, err := unlockPrimaryAddress(ctx, c, []byte(password))
+	addrKR, addrEmail, saltedPass, err := unlockPrimaryAddress(ctx, c, []byte(password))
 	if err != nil {
 		_ = c.AuthDelete(ctx)
 		return nil, SessionCredentials{}, err
@@ -126,7 +132,7 @@ func NewSession(ctx context.Context, mgr *proton.Manager, username, password str
 		RefreshToken:     auth.RefreshToken,
 		SaltedPassphrase: saltedPass,
 	}
-	s := newSession(c, shareID, volumeID, rootID, username, addrKR)
+	s := newSession(c, shareID, volumeID, rootID, username, addrEmail, addrKR)
 	s.setAuth(auth.UID, auth.AccessToken)
 	return s, creds, nil
 }
@@ -144,7 +150,7 @@ func NewSessionWithHV(ctx context.Context, mgr *proton.Manager, username, passwo
 		return nil, SessionCredentials{}, err
 	}
 
-	addrKR, saltedPass, err := unlockPrimaryAddress(ctx, c, []byte(password))
+	addrKR, addrEmail, saltedPass, err := unlockPrimaryAddress(ctx, c, []byte(password))
 	if err != nil {
 		_ = c.AuthDelete(ctx)
 		return nil, SessionCredentials{}, err
@@ -161,7 +167,7 @@ func NewSessionWithHV(ctx context.Context, mgr *proton.Manager, username, passwo
 		RefreshToken:     auth.RefreshToken,
 		SaltedPassphrase: saltedPass,
 	}
-	s := newSession(c, shareID, volumeID, rootID, username, addrKR)
+	s := newSession(c, shareID, volumeID, rootID, username, addrEmail, addrKR)
 	s.setAuth(auth.UID, auth.AccessToken)
 	return s, creds, nil
 }
@@ -176,7 +182,7 @@ func ResumeSession(ctx context.Context, mgr *proton.Manager, creds SessionCreden
 		return nil, SessionCredentials{}, fmt.Errorf("token refresh failed: %w", err)
 	}
 
-	addrKR, err := unlockWithSaltedPassphrase(ctx, c, creds.SaltedPassphrase)
+	addrKR, addrEmail, err := unlockWithSaltedPassphrase(ctx, c, creds.SaltedPassphrase)
 	if err != nil {
 		_ = c.AuthDelete(ctx)
 		return nil, SessionCredentials{}, err
@@ -197,7 +203,7 @@ func ResumeSession(ctx context.Context, mgr *proton.Manager, creds SessionCreden
 		RefreshToken:     auth.RefreshToken,
 		SaltedPassphrase: creds.SaltedPassphrase,
 	}
-	s := newSession(c, shareID, volumeID, rootID, account, addrKR)
+	s := newSession(c, shareID, volumeID, rootID, account, addrEmail, addrKR)
 	s.setAuth(auth.UID, auth.AccessToken)
 	return s, newCreds, nil
 }
@@ -205,13 +211,14 @@ func ResumeSession(ctx context.Context, mgr *proton.Manager, creds SessionCreden
 // newSession is the single place where Session is constructed.  It
 // initialises the metadata cache and, if the cache directory is reachable, the
 // persistent block cache.
-func newSession(c *proton.Client, shareID, volumeID, rootID, account string, addrKR *crypto.KeyRing) *Session {
+func newSession(c *proton.Client, shareID, volumeID, rootID, account, addrEmail string, addrKR *crypto.KeyRing) *Session {
 	s := &Session{
 		client:    c,
 		shareID:   shareID,
 		volumeID:  volumeID,
 		rootID:    rootID,
 		account:   account,
+		addrEmail: addrEmail,
 		apiBase:   proton.DefaultHostURL,
 		addrKR:    addrKR,
 		nodeKRs:   make(map[string]*crypto.KeyRing),
@@ -545,11 +552,147 @@ func sliceRange(buf []byte, startBlock0 int, offset, length int64) []byte {
 	return buf
 }
 
+// ErrAlreadyExists is returned when a Mkdir target name already exists.
+var ErrAlreadyExists = errors.New("already exists")
+
+// isAlreadyExistsError returns true when the Proton API reports code 2500.
+func isAlreadyExistsError(err error) bool {
+	var apiErr proton.APIError
+	return errors.As(err, &apiErr) && apiErr.Code == 2500
+}
+
 // MakeDir creates a folder at the given path.
-// TODO: key generation for NodeKey/NodePassphrase/NodeHashKey requires
-// crypto helpers not yet exposed by go-proton-api. Implement once available.
-func (s *Session) MakeDir(_ context.Context, _ string) error {
-	return fmt.Errorf("MakeDir: not yet implemented")
+func (s *Session) MakeDir(ctx context.Context, p string) error {
+	parent := path.Dir(p)
+	name := path.Base(p)
+
+	// Resolve parent to get its linkID and keyring.
+	parentLink, _, err := s.Stat(ctx, parent)
+	if err != nil {
+		return err
+	}
+	parentKR, err := s.nodeKeyRing(ctx, parentLink)
+	if err != nil {
+		return fmt.Errorf("MakeDir: parent keyring: %w", err)
+	}
+
+	// Get parent hash key for NameHash computation.
+	hashKey, err := parentLink.GetHashKey(parentKR)
+	if err != nil {
+		return fmt.Errorf("MakeDir: hash key: %w", err)
+	}
+
+	// Generate a fresh x25519 NodeKey for the new folder.
+	nodeKey, err := crypto.GenerateKey(s.addrEmail, s.addrEmail, "x25519", 0)
+	if err != nil {
+		return fmt.Errorf("MakeDir: generate node key: %w", err)
+	}
+
+	// Generate a random 32-byte NodePassphrase, base64-encoded.
+	// The passphrase is stored and transmitted as a base64 string so that
+	// all clients (web, mobile) can decode it as UTF-8 text.
+	// The NodeKey is locked with the UTF-8 bytes of this base64 string.
+	rawPass := make([]byte, 32)
+	if _, err := rand.Read(rawPass); err != nil {
+		return fmt.Errorf("MakeDir: generate passphrase: %w", err)
+	}
+	passB64 := base64.StdEncoding.EncodeToString(rawPass)
+
+	// Lock the NodeKey with the UTF-8 bytes of the base64 passphrase.
+	lockedKey, err := nodeKey.Lock([]byte(passB64))
+	if err != nil {
+		return fmt.Errorf("MakeDir: lock node key: %w", err)
+	}
+	armoredNodeKey, err := lockedKey.Armor()
+	if err != nil {
+		return fmt.Errorf("MakeDir: armor node key: %w", err)
+	}
+
+	// Encrypt the passphrase with the parent's NodeKey.
+	encPass, err := parentKR.Encrypt(
+		crypto.NewPlainMessageFromString(passB64),
+		nil,
+	)
+	if err != nil {
+		return fmt.Errorf("MakeDir: encrypt passphrase: %w", err)
+	}
+	armoredPass, err := encPass.GetArmored()
+	if err != nil {
+		return fmt.Errorf("MakeDir: armor passphrase: %w", err)
+	}
+
+	// Sign the passphrase with the address key.
+	passSig, err := s.addrKR.SignDetached(crypto.NewPlainMessageFromString(passB64))
+	if err != nil {
+		return fmt.Errorf("MakeDir: sign passphrase: %w", err)
+	}
+	armoredPassSig, err := passSig.GetArmored()
+	if err != nil {
+		return fmt.Errorf("MakeDir: armor passphrase sig: %w", err)
+	}
+
+	// Build the new folder's NodeKeyRing so we can encrypt the NodeHashKey.
+	nodeKR, err := crypto.NewKeyRing(nodeKey)
+	if err != nil {
+		return fmt.Errorf("MakeDir: new node keyring: %w", err)
+	}
+
+	// Generate a random 32-byte NodeHashKey and encrypt it with the new NodeKey.
+	rawHashKey := make([]byte, 32)
+	if _, err := rand.Read(rawHashKey); err != nil {
+		return fmt.Errorf("MakeDir: generate hash key: %w", err)
+	}
+	encHashKey, err := nodeKR.Encrypt(crypto.NewPlainMessage(rawHashKey), s.addrKR)
+	if err != nil {
+		return fmt.Errorf("MakeDir: encrypt hash key: %w", err)
+	}
+	armoredHashKey, err := encHashKey.GetArmored()
+	if err != nil {
+		return fmt.Errorf("MakeDir: armor hash key: %w", err)
+	}
+
+	// Encrypt the folder name with the parent's NodeKey, signed by address key.
+	encName, err := parentKR.Encrypt(
+		crypto.NewPlainMessageFromString(name),
+		s.addrKR,
+	)
+	if err != nil {
+		return fmt.Errorf("MakeDir: encrypt name: %w", err)
+	}
+	armoredName, err := encName.GetArmored()
+	if err != nil {
+		return fmt.Errorf("MakeDir: armor name: %w", err)
+	}
+
+	// Compute NameHash = hex(HMAC-SHA256(hashKey, name_utf8)).
+	mac := hmac.New(sha256.New, hashKey)
+	mac.Write([]byte(name))
+	nameHash := hex.EncodeToString(mac.Sum(nil))
+
+	req := proton.CreateFolderReq{
+		ParentLinkID:            parentLink.LinkID,
+		Name:                    armoredName,
+		Hash:                    nameHash,
+		NodeKey:                 armoredNodeKey,
+		NodeHashKey:             armoredHashKey,
+		NodePassphrase:          armoredPass,
+		NodePassphraseSignature: armoredPassSig,
+		SignatureAddress:        s.addrEmail,
+	}
+
+	_, err = s.client.CreateFolder(ctx, s.shareID, req)
+	if isAlreadyExistsError(err) {
+		s.meta.InvalidatePath(parent)
+		return ErrAlreadyExists
+	}
+	if err != nil {
+		s.meta.InvalidatePath(parent)
+		return fmt.Errorf("MakeDir: API: %w", err)
+	}
+
+	// Invalidate parent so subsequent ListDir reflects the new entry.
+	s.meta.InvalidatePath(parent)
+	return nil
 }
 
 // Move renames or moves a link.
@@ -699,6 +842,15 @@ func (s *Session) shareKeyRing(ctx context.Context) (*crypto.KeyRing, error) {
 	return kr, nil
 }
 
+// nodeKeyRing returns the cached keyring for link. Stat/resolvePath always
+// populates nodeKRs before returning, so a cache miss here is unexpected.
+func (s *Session) nodeKeyRing(_ context.Context, link proton.Link) (*crypto.KeyRing, error) {
+	if kr, ok := s.nodeKRs[link.LinkID]; ok {
+		return kr, nil
+	}
+	return nil, fmt.Errorf("node keyring not cached for link %s", link.LinkID)
+}
+
 // rootNodeKeyRing returns the node keyring for the root folder. Children's
 // names and keys are encrypted with the parent's NODE keyring, so listing
 // root's children requires the root link's node keyring, not the share keyring.
@@ -733,54 +885,55 @@ func splitPath(p string) []string {
 // unlockPrimaryAddress derives the salted passphrase from the raw password,
 // unlocks the address keyring, and returns both so the passphrase can be
 // stored in the keyring for future passwordless resumes.
-func unlockPrimaryAddress(ctx context.Context, c *proton.Client, password []byte) (*crypto.KeyRing, []byte, error) {
+func unlockPrimaryAddress(ctx context.Context, c *proton.Client, password []byte) (*crypto.KeyRing, string, []byte, error) {
 	user, err := c.GetUser(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, "", nil, err
 	}
 
 	salts, err := c.GetSalts(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, "", nil, err
 	}
 
 	saltedPass, err := salts.SaltForKey(password, user.Keys[0].ID)
 	if err != nil {
-		return nil, nil, err
+		return nil, "", nil, err
 	}
 
-	kr, err := unlockWithSaltedPassphrase(ctx, c, saltedPass)
+	kr, email, err := unlockWithSaltedPassphrase(ctx, c, saltedPass)
 	if err != nil {
-		return nil, nil, err
+		return nil, "", nil, err
 	}
-	return kr, saltedPass, nil
+	return kr, email, saltedPass, nil
 }
 
 // unlockWithSaltedPassphrase restores the address keyring from the stored
 // salted passphrase — no raw password needed.
-func unlockWithSaltedPassphrase(ctx context.Context, c *proton.Client, saltedPass []byte) (*crypto.KeyRing, error) {
+// Also returns the email of the primary unlocked address for use as SignatureAddress.
+func unlockWithSaltedPassphrase(ctx context.Context, c *proton.Client, saltedPass []byte) (*crypto.KeyRing, string, error) {
 	user, err := c.GetUser(ctx)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	addrs, err := c.GetAddresses(ctx)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	_, addrKRs, err := proton.Unlock(user, addrs, saltedPass, async.NoopPanicHandler{})
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	for _, addr := range addrs {
 		if kr, ok := addrKRs[addr.ID]; ok {
-			return kr, nil
+			return kr, addr.Email, nil
 		}
 	}
 
-	return nil, fmt.Errorf("no address keyring found")
+	return nil, "", fmt.Errorf("no address keyring found")
 }
 
 func findMainShare(ctx context.Context, c *proton.Client) (shareID, volumeID, rootID string, err error) {
