@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -587,14 +588,18 @@ func (s *Session) MakeDir(ctx context.Context, p string) error {
 		return fmt.Errorf("MakeDir: generate node key: %w", err)
 	}
 
-	// Generate a random 32-byte NodePassphrase.
-	passBytes := make([]byte, 32)
-	if _, err := rand.Read(passBytes); err != nil {
+	// Generate a random 32-byte NodePassphrase, base64-encoded.
+	// The passphrase is stored and transmitted as a base64 string so that
+	// all clients (web, mobile) can decode it as UTF-8 text.
+	// The NodeKey is locked with the UTF-8 bytes of this base64 string.
+	rawPass := make([]byte, 32)
+	if _, err := rand.Read(rawPass); err != nil {
 		return fmt.Errorf("MakeDir: generate passphrase: %w", err)
 	}
+	passB64 := base64.StdEncoding.EncodeToString(rawPass)
 
-	// Lock the NodeKey with its own passphrase.
-	lockedKey, err := nodeKey.Lock(passBytes)
+	// Lock the NodeKey with the UTF-8 bytes of the base64 passphrase.
+	lockedKey, err := nodeKey.Lock([]byte(passB64))
 	if err != nil {
 		return fmt.Errorf("MakeDir: lock node key: %w", err)
 	}
@@ -605,7 +610,7 @@ func (s *Session) MakeDir(ctx context.Context, p string) error {
 
 	// Encrypt the passphrase with the parent's NodeKey.
 	encPass, err := parentKR.Encrypt(
-		crypto.NewPlainMessage(passBytes),
+		crypto.NewPlainMessageFromString(passB64),
 		nil,
 	)
 	if err != nil {
@@ -617,7 +622,7 @@ func (s *Session) MakeDir(ctx context.Context, p string) error {
 	}
 
 	// Sign the passphrase with the address key.
-	passSig, err := s.addrKR.SignDetached(crypto.NewPlainMessage(passBytes))
+	passSig, err := s.addrKR.SignDetached(crypto.NewPlainMessageFromString(passB64))
 	if err != nil {
 		return fmt.Errorf("MakeDir: sign passphrase: %w", err)
 	}
