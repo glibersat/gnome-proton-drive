@@ -168,6 +168,25 @@ client (see `docs/reference.md`).
 Implement `Mkdir` and `WriteFile` in `drive/session.go` and register handlers
 in `main.go`. `Move` / `Rename` tracks against `go-proton-api` releases.
 
+**WriteFile upload strategy — buffer-then-upload (M3)**
+
+GVfs `WriteFile` streams bytes in chunks via `do_write` then calls `do_close_write`.
+The M3 implementation buffers all written bytes in a temp file and runs the full
+encrypt+upload pipeline on close. Simple and correct; maps naturally to the GVfs
+write handle model.
+
+**Future: streaming pipeline (post-M3)**
+
+The Windows client uses a TPL Dataflow pipeline that encrypts and uploads blocks as
+they fill up (3 concurrent), committing the revision on close. Adopt this once the
+buffer approach is validated:
+
+- `do_write` feeds a channel; a goroutine encrypts completed 4 MiB blocks and batches
+  upload URL requests concurrently.
+- `do_close_write` drains the channel, encrypts the final partial block, and commits
+  the revision.
+- Reduces peak memory/disk usage and enables progress reporting for large files.
+
 ### B4. Event polling ✅
 
 Polls `/drive/volumes/{id}/events/{anchorID}` every 30 s via `EventPoller`
