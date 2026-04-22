@@ -197,8 +197,9 @@ Polls `/drive/volumes/{id}/events/{anchorID}` every 30 s via `EventPoller`
 
 | Gap | Impact | Fix |
 |---|---|---|
-| `HasMoreData` not drained immediately | Burst of events takes many 30 s ticks to process | Loop until `HasMoreData == false` before waiting for next tick |
 | `UpdateMetadata` not distinguished from `EventChanged` for renames/moves | Renames appear as delete+create instead of move | Add `EventMoved` type for future C3 move propagation (B3 dependency) |
+
+`HasMoreData` paging is handled internally by `go-proton-api`'s `GetVolumeEvent`, which loops until `More == false` before returning — no action needed in the helper.
 
 ---
 
@@ -308,7 +309,7 @@ overwrite. Revisit once revision history API is accessible.
 | Milestone | Tracks | Deliverable | Status |
 |---|---|---|---|
 | **M1 — Read-only mount** | A1 + A2 + B1 + C1 + C2 | Proton Drive visible in Nautilus; files openable read-only | ✅ Complete — volume monitor implemented; manual `gio mount` no longer required |
-| **M2 — Live updates** | B4 + C3 (remote→local) | Nautilus refreshes when remote changes | ✅ Core complete — volume-level polling, anchor persistence, diff-based CREATED/DELETED, trash detection all working. `HasMoreData` paging and move/rename distinction pending |
+| **M2 — Live updates** | B4 + C3 (remote→local) | Nautilus refreshes when remote changes | ✅ Complete — volume-level polling, anchor persistence, diff-based CREATED/DELETED, trash detection, and `HasMoreData` paging all working. Move/rename distinction deferred to M3 (B3 dependency) |
 | **M3 — Full read/write** | B3 + C1 (writes) + C3 | Create, edit, move, delete from Nautilus | Blocked on go-proton-api |
 | **M4 — Settings panel** | A3-a or A3-b | Proton Drive in GNOME Settings → Online Accounts | Not started |
 | **M5 — Cache + offline** | C4 | Fast repeated access; reads served from disk when offline — *read-only tier done; pinning and write-queue pending* | Partial |

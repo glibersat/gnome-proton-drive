@@ -214,7 +214,7 @@ one JSON object terminated by `\n`.
 | Move / rename | ⏳ `MoveLink` not yet in go-proton-api |
 | Write file | ⏳ Block upload + revision creation |
 | GNOME volume monitor | ✅ Implemented (libsecret + D-Bus watch, auto-appears in Nautilus) |
-| Event polling (remote → Nautilus) | ✅ Volume-level, anchor-persisted; `HasMoreData` paging pending |
+| Event polling (remote → Nautilus) | ✅ Volume-level, anchor-persisted, full paging via `go-proton-api` |
 | Block cache re-encryption | 🔲 Currently stored as plaintext |
 | Pinned offline files | 🔲 Not started |
 | GNOME Online Accounts integration | 🔲 Future (post-M3) |
