@@ -48,7 +48,8 @@ type Session struct {
 	cacheBase string   // overrides blockCacheBase(account) when set (used in tests)
 	apiBase   string   // Proton API base URL, e.g. https://mail.proton.me/api
 	auth      authState // rolling access token captured from the proton client
-	addrKR   *crypto.KeyRing            // primary address keyring
+	addrKR    *crypto.KeyRing            // primary address keyring
+	addrEmail string                     // email of the primary address (used as SignatureAddress)
 	shareKR  *crypto.KeyRing            // share keyring (unlocked with addrKR)
 	nodeKRs   map[string]*crypto.KeyRing // linkID → decrypted node keyring (cache)
 	linkPaths map[string]string          // linkID → absolute path (reverse map for event resolution)
@@ -114,7 +115,7 @@ func NewSession(ctx context.Context, mgr *proton.Manager, username, password str
 		return nil, SessionCredentials{}, err
 	}
 
-	addrKR, saltedPass, err := unlockPrimaryAddress(ctx, c, []byte(password))
+	addrKR, addrEmail, saltedPass, err := unlockPrimaryAddress(ctx, c, []byte(password))
 	if err != nil {
 		_ = c.AuthDelete(ctx)
 		return nil, SessionCredentials{}, err
@@ -131,7 +132,7 @@ func NewSession(ctx context.Context, mgr *proton.Manager, username, password str
 		RefreshToken:     auth.RefreshToken,
 		SaltedPassphrase: saltedPass,
 	}
-	s := newSession(c, shareID, volumeID, rootID, username, addrKR)
+	s := newSession(c, shareID, volumeID, rootID, username, addrEmail, addrKR)
 	s.setAuth(auth.UID, auth.AccessToken)
 	return s, creds, nil
 }
@@ -149,7 +150,7 @@ func NewSessionWithHV(ctx context.Context, mgr *proton.Manager, username, passwo
 		return nil, SessionCredentials{}, err
 	}
 
-	addrKR, saltedPass, err := unlockPrimaryAddress(ctx, c, []byte(password))
+	addrKR, addrEmail, saltedPass, err := unlockPrimaryAddress(ctx, c, []byte(password))
 	if err != nil {
 		_ = c.AuthDelete(ctx)
 		return nil, SessionCredentials{}, err
@@ -166,7 +167,7 @@ func NewSessionWithHV(ctx context.Context, mgr *proton.Manager, username, passwo
 		RefreshToken:     auth.RefreshToken,
 		SaltedPassphrase: saltedPass,
 	}
-	s := newSession(c, shareID, volumeID, rootID, username, addrKR)
+	s := newSession(c, shareID, volumeID, rootID, username, addrEmail, addrKR)
 	s.setAuth(auth.UID, auth.AccessToken)
 	return s, creds, nil
 }
@@ -181,7 +182,7 @@ func ResumeSession(ctx context.Context, mgr *proton.Manager, creds SessionCreden
 		return nil, SessionCredentials{}, fmt.Errorf("token refresh failed: %w", err)
 	}
 
-	addrKR, err := unlockWithSaltedPassphrase(ctx, c, creds.SaltedPassphrase)
+	addrKR, addrEmail, err := unlockWithSaltedPassphrase(ctx, c, creds.SaltedPassphrase)
 	if err != nil {
 		_ = c.AuthDelete(ctx)
 		return nil, SessionCredentials{}, err
@@ -202,7 +203,7 @@ func ResumeSession(ctx context.Context, mgr *proton.Manager, creds SessionCreden
 		RefreshToken:     auth.RefreshToken,
 		SaltedPassphrase: creds.SaltedPassphrase,
 	}
-	s := newSession(c, shareID, volumeID, rootID, account, addrKR)
+	s := newSession(c, shareID, volumeID, rootID, account, addrEmail, addrKR)
 	s.setAuth(auth.UID, auth.AccessToken)
 	return s, newCreds, nil
 }
@@ -210,13 +211,14 @@ func ResumeSession(ctx context.Context, mgr *proton.Manager, creds SessionCreden
 // newSession is the single place where Session is constructed.  It
 // initialises the metadata cache and, if the cache directory is reachable, the
 // persistent block cache.
-func newSession(c *proton.Client, shareID, volumeID, rootID, account string, addrKR *crypto.KeyRing) *Session {
+func newSession(c *proton.Client, shareID, volumeID, rootID, account, addrEmail string, addrKR *crypto.KeyRing) *Session {
 	s := &Session{
 		client:    c,
 		shareID:   shareID,
 		volumeID:  volumeID,
 		rootID:    rootID,
 		account:   account,
+		addrEmail: addrEmail,
 		apiBase:   proton.DefaultHostURL,
 		addrKR:    addrKR,
 		nodeKRs:   make(map[string]*crypto.KeyRing),
@@ -581,7 +583,7 @@ func (s *Session) MakeDir(ctx context.Context, p string) error {
 	}
 
 	// Generate a fresh x25519 NodeKey for the new folder.
-	nodeKey, err := crypto.GenerateKey(s.account, s.account, "x25519", 0)
+	nodeKey, err := crypto.GenerateKey(s.addrEmail, s.addrEmail, "x25519", 0)
 	if err != nil {
 		return fmt.Errorf("MakeDir: generate node key: %w", err)
 	}
@@ -672,7 +674,7 @@ func (s *Session) MakeDir(ctx context.Context, p string) error {
 		NodeHashKey:             armoredHashKey,
 		NodePassphrase:          armoredPass,
 		NodePassphraseSignature: armoredPassSig,
-		SignatureAddress:        s.account,
+		SignatureAddress:        s.addrEmail,
 	}
 
 	_, err = s.client.CreateFolder(ctx, s.shareID, req)
@@ -880,54 +882,55 @@ func splitPath(p string) []string {
 // unlockPrimaryAddress derives the salted passphrase from the raw password,
 // unlocks the address keyring, and returns both so the passphrase can be
 // stored in the keyring for future passwordless resumes.
-func unlockPrimaryAddress(ctx context.Context, c *proton.Client, password []byte) (*crypto.KeyRing, []byte, error) {
+func unlockPrimaryAddress(ctx context.Context, c *proton.Client, password []byte) (*crypto.KeyRing, string, []byte, error) {
 	user, err := c.GetUser(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, "", nil, err
 	}
 
 	salts, err := c.GetSalts(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, "", nil, err
 	}
 
 	saltedPass, err := salts.SaltForKey(password, user.Keys[0].ID)
 	if err != nil {
-		return nil, nil, err
+		return nil, "", nil, err
 	}
 
-	kr, err := unlockWithSaltedPassphrase(ctx, c, saltedPass)
+	kr, email, err := unlockWithSaltedPassphrase(ctx, c, saltedPass)
 	if err != nil {
-		return nil, nil, err
+		return nil, "", nil, err
 	}
-	return kr, saltedPass, nil
+	return kr, email, saltedPass, nil
 }
 
 // unlockWithSaltedPassphrase restores the address keyring from the stored
 // salted passphrase — no raw password needed.
-func unlockWithSaltedPassphrase(ctx context.Context, c *proton.Client, saltedPass []byte) (*crypto.KeyRing, error) {
+// Also returns the email of the primary unlocked address for use as SignatureAddress.
+func unlockWithSaltedPassphrase(ctx context.Context, c *proton.Client, saltedPass []byte) (*crypto.KeyRing, string, error) {
 	user, err := c.GetUser(ctx)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	addrs, err := c.GetAddresses(ctx)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	_, addrKRs, err := proton.Unlock(user, addrs, saltedPass, async.NoopPanicHandler{})
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	for _, addr := range addrs {
 		if kr, ok := addrKRs[addr.ID]; ok {
-			return kr, nil
+			return kr, addr.Email, nil
 		}
 	}
 
-	return nil, fmt.Errorf("no address keyring found")
+	return nil, "", fmt.Errorf("no address keyring found")
 }
 
 func findMainShare(ctx context.Context, c *proton.Client) (shareID, volumeID, rootID string, err error) {
