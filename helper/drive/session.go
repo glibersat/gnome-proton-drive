@@ -5,7 +5,6 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -593,7 +592,6 @@ func (s *Session) MakeDir(ctx context.Context, p string) error {
 	if _, err := rand.Read(passBytes); err != nil {
 		return fmt.Errorf("MakeDir: generate passphrase: %w", err)
 	}
-	passB64 := base64.StdEncoding.EncodeToString(passBytes)
 
 	// Lock the NodeKey with its own passphrase.
 	lockedKey, err := nodeKey.Lock(passBytes)
@@ -607,7 +605,7 @@ func (s *Session) MakeDir(ctx context.Context, p string) error {
 
 	// Encrypt the passphrase with the parent's NodeKey.
 	encPass, err := parentKR.Encrypt(
-		crypto.NewPlainMessageFromString(passB64),
+		crypto.NewPlainMessage(passBytes),
 		nil,
 	)
 	if err != nil {
@@ -619,7 +617,7 @@ func (s *Session) MakeDir(ctx context.Context, p string) error {
 	}
 
 	// Sign the passphrase with the address key.
-	passSig, err := s.addrKR.SignDetached(crypto.NewPlainMessageFromString(passB64))
+	passSig, err := s.addrKR.SignDetached(crypto.NewPlainMessage(passBytes))
 	if err != nil {
 		return fmt.Errorf("MakeDir: sign passphrase: %w", err)
 	}
