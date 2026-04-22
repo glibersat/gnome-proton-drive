@@ -332,9 +332,13 @@ overwrite. Revisit once revision history API is accessible.
    specific commit. Policy needed: periodic manual upgrade or request a
    semver tag from upstream.
 
-5. **MetaCache TTL vs. LRU:** The current 30 s TTL is a correctness safety net
-   for missed events. Now that volume-level polling with anchor persistence is
-   in place, event-driven invalidation (`InvalidatePath`) is the primary
-   freshness mechanism. Replace the TTL map with a pure entry-count LRU so hot
-   directories are never unnecessarily re-fetched; the offline stale fallback
-   (`GetListStale` / `GetStatStale`) continues to work unchanged.
+5. **MetaCache TTL vs. LRU:** Event-driven invalidation (`InvalidatePath`) is
+   the primary freshness mechanism, but a TTL backstop is still needed: if the
+   helper is offline for long enough that the server's event log rolls over,
+   the anchor recovery re-anchors at the current head but cannot replay the
+   missed events — stale entries would persist until the next relevant event or
+   helper restart. Approach: raise the TTL to 5 min (from 30 s) and add an
+   entry-count LRU cap so hot directories are never unnecessarily re-fetched,
+   while missed-event staleness self-heals within a few minutes. The offline
+   stale fallback (`GetListStale` / `GetStatStale`) continues to work
+   unchanged.
