@@ -157,17 +157,16 @@ layers on every tree walk:
 ### B3. Write operations
 
 The API calls exist and their parameters are fully documented from the Windows
-client (see `docs/reference.md`). Three sub-tasks remain blocked on
-`go-proton-api` not wrapping the required crypto steps:
+client (see `docs/reference.md`).
 
-| Sub-task | API | Blocker |
+| Sub-task | API | Status |
 |---|---|---|
-| `Mkdir` | `POST /shares/{id}/folders` | Must generate `NodeKey` (Ed25519+X25519), random `NodePassphrase` (32 bytes, base64), encrypt passphrase with parent `NodeKey`, compute `NameHash = HMAC-SHA256(hashKey, name)`. go-proton-api exposes the endpoint but not the key-generation helpers. |
-| `WriteFile` | `POST /shares/{id}/files` → `POST /shares/{id}/files/{id}/revisions` → `POST /blocks` → commit | Blocks are 4 MiB, encrypted with a per-file `SessionKey` (PGP data packet), signed, SHA-256 hashed. Upload pipeline: batch-request URLs, then PUT multipart (3 concurrent). Crypto wrapper missing from go-proton-api. |
-| `Move` / `Rename` | `PUT /shares/{id}/links/{id}/move` | Passphrase must be re-encrypted under the new parent's `NodeKey`; `NameHash` recomputed. `MoveLink` call missing from go-proton-api. |
+| `Mkdir` | `POST /shares/{id}/folders` | Unblocked. `CreateFolder` exists in go-proton-api. Requires implementing crypto in the helper: generate `NodeKey` (Ed25519+X25519), random `NodePassphrase` (32 bytes), encrypt passphrase with parent `NodeKey`, compute `NameHash = HMAC-SHA256(hashKey, name)` — all doable with `gopenpgp`. |
+| `WriteFile` | `POST /shares/{id}/files` → `POST /blocks` → `PUT /revisions/{id}` | Unblocked. `CreateFile`, `RequestBlockUpload`, `UploadBlock`, and `UpdateRevision` all exist. Requires implementing block encryption (per-file `SessionKey`, PGP data packet, SHA-256 manifest) and the 3-concurrent upload pipeline using `gopenpgp`. |
+| `Move` / `Rename` | `PUT /shares/{id}/links/{id}/move` | Blocked on upstream. `MoveLink` is missing from go-proton-api; passphrase re-encryption under new parent `NodeKey` and `NameHash` recomputation also needed. |
 
-Track against `go-proton-api` releases. When unblocked, implement in
-`drive/session.go` and register the handlers in `main.go`.
+Implement `Mkdir` and `WriteFile` in `drive/session.go` and register handlers
+in `main.go`. `Move` / `Rename` tracks against `go-proton-api` releases.
 
 ### B4. Event polling ✅
 
@@ -310,7 +309,7 @@ overwrite. Revisit once revision history API is accessible.
 |---|---|---|---|
 | **M1 — Read-only mount** | A1 + A2 + B1 + C1 + C2 | Proton Drive visible in Nautilus; files openable read-only | ✅ Complete — volume monitor implemented; manual `gio mount` no longer required |
 | **M2 — Live updates** | B4 + C3 (remote→local) | Nautilus refreshes when remote changes | ✅ Complete — volume-level polling, anchor persistence, diff-based CREATED/DELETED, trash detection, and `HasMoreData` paging all working. Move/rename distinction deferred to M3 (B3 dependency) |
-| **M3 — Full read/write** | B3 + C1 (writes) + C3 | Create, edit, move, delete from Nautilus | Blocked on go-proton-api |
+| **M3 — Full read/write** | B3 + C1 (writes) + C3 | Create, edit, move, delete from Nautilus | In progress — `Mkdir` and `WriteFile` unblocked; `Move`/`Rename` blocked on `MoveLink` in go-proton-api |
 | **M4 — Settings panel** | A3-a or A3-b | Proton Drive in GNOME Settings → Online Accounts | Not started |
 | **M5 — Cache + offline** | C4 | Fast repeated access; reads served from disk when offline — *read-only tier done; pinning and write-queue pending* | Partial |
 
