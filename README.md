@@ -169,7 +169,7 @@ See [docs/rpc-api.md](docs/rpc-api.md) for the full method and error code refere
 | Thumbnails (server-side, cached, shown in Nautilus) | ✅ |
 | GVfs C backend (read-only) | ✅ |
 | Delete / trash | ✅ (helper only — not exposed via GVfs yet) |
-| Create directory | ⏳ Unblocked — crypto implementation pending |
+| Create directory | ✅ Implemented (helper) — GVfs vtable pending |
 | Move / rename | ⏳ Blocked on `MoveLink` in go-proton-api |
 | Write file | ⏳ Unblocked — block encryption + upload pipeline pending |
 | GNOME volume monitor | ✅ Implemented (libsecret + D-Bus watch, auto-appears in Nautilus) |

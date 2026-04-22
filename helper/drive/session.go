@@ -2,6 +2,11 @@ package drive
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -545,11 +550,144 @@ func sliceRange(buf []byte, startBlock0 int, offset, length int64) []byte {
 	return buf
 }
 
+// ErrAlreadyExists is returned when a Mkdir target name already exists.
+var ErrAlreadyExists = errors.New("already exists")
+
+// isAlreadyExistsError returns true when the Proton API reports code 2500.
+func isAlreadyExistsError(err error) bool {
+	var apiErr proton.APIError
+	return errors.As(err, &apiErr) && apiErr.Code == 2500
+}
+
 // MakeDir creates a folder at the given path.
-// TODO: key generation for NodeKey/NodePassphrase/NodeHashKey requires
-// crypto helpers not yet exposed by go-proton-api. Implement once available.
-func (s *Session) MakeDir(_ context.Context, _ string) error {
-	return fmt.Errorf("MakeDir: not yet implemented")
+func (s *Session) MakeDir(ctx context.Context, p string) error {
+	parent := path.Dir(p)
+	name := path.Base(p)
+
+	// Resolve parent to get its linkID and keyring.
+	parentLink, _, err := s.Stat(ctx, parent)
+	if err != nil {
+		return err
+	}
+	parentKR, err := s.nodeKeyRing(ctx, parentLink)
+	if err != nil {
+		return fmt.Errorf("MakeDir: parent keyring: %w", err)
+	}
+
+	// Get parent hash key for NameHash computation.
+	hashKey, err := parentLink.GetHashKey(parentKR)
+	if err != nil {
+		return fmt.Errorf("MakeDir: hash key: %w", err)
+	}
+
+	// Generate a fresh x25519 NodeKey for the new folder.
+	nodeKey, err := crypto.GenerateKey(s.account, s.account, "x25519", 0)
+	if err != nil {
+		return fmt.Errorf("MakeDir: generate node key: %w", err)
+	}
+
+	// Generate a random 32-byte NodePassphrase.
+	passBytes := make([]byte, 32)
+	if _, err := rand.Read(passBytes); err != nil {
+		return fmt.Errorf("MakeDir: generate passphrase: %w", err)
+	}
+	passB64 := base64.StdEncoding.EncodeToString(passBytes)
+
+	// Lock the NodeKey with its own passphrase.
+	lockedKey, err := nodeKey.Lock(passBytes)
+	if err != nil {
+		return fmt.Errorf("MakeDir: lock node key: %w", err)
+	}
+	armoredNodeKey, err := lockedKey.Armor()
+	if err != nil {
+		return fmt.Errorf("MakeDir: armor node key: %w", err)
+	}
+
+	// Encrypt the passphrase with the parent's NodeKey.
+	encPass, err := parentKR.Encrypt(
+		crypto.NewPlainMessageFromString(passB64),
+		nil,
+	)
+	if err != nil {
+		return fmt.Errorf("MakeDir: encrypt passphrase: %w", err)
+	}
+	armoredPass, err := encPass.GetArmored()
+	if err != nil {
+		return fmt.Errorf("MakeDir: armor passphrase: %w", err)
+	}
+
+	// Sign the passphrase with the address key.
+	passSig, err := s.addrKR.SignDetached(crypto.NewPlainMessageFromString(passB64))
+	if err != nil {
+		return fmt.Errorf("MakeDir: sign passphrase: %w", err)
+	}
+	armoredPassSig, err := passSig.GetArmored()
+	if err != nil {
+		return fmt.Errorf("MakeDir: armor passphrase sig: %w", err)
+	}
+
+	// Build the new folder's NodeKeyRing so we can encrypt the NodeHashKey.
+	nodeKR, err := crypto.NewKeyRing(nodeKey)
+	if err != nil {
+		return fmt.Errorf("MakeDir: new node keyring: %w", err)
+	}
+
+	// Generate a random 32-byte NodeHashKey and encrypt it with the new NodeKey.
+	rawHashKey := make([]byte, 32)
+	if _, err := rand.Read(rawHashKey); err != nil {
+		return fmt.Errorf("MakeDir: generate hash key: %w", err)
+	}
+	encHashKey, err := nodeKR.Encrypt(crypto.NewPlainMessage(rawHashKey), nil)
+	if err != nil {
+		return fmt.Errorf("MakeDir: encrypt hash key: %w", err)
+	}
+	armoredHashKey, err := encHashKey.GetArmored()
+	if err != nil {
+		return fmt.Errorf("MakeDir: armor hash key: %w", err)
+	}
+
+	// Encrypt the folder name with the parent's NodeKey, signed by address key.
+	encName, err := parentKR.Encrypt(
+		crypto.NewPlainMessageFromString(name),
+		s.addrKR,
+	)
+	if err != nil {
+		return fmt.Errorf("MakeDir: encrypt name: %w", err)
+	}
+	armoredName, err := encName.GetArmored()
+	if err != nil {
+		return fmt.Errorf("MakeDir: armor name: %w", err)
+	}
+
+	// Compute NameHash = hex(HMAC-SHA256(hashKey, name_utf8)).
+	mac := hmac.New(sha256.New, hashKey)
+	mac.Write([]byte(name))
+	nameHash := hex.EncodeToString(mac.Sum(nil))
+
+	req := proton.CreateFolderReq{
+		ParentLinkID:            parentLink.LinkID,
+		Name:                    armoredName,
+		Hash:                    nameHash,
+		NodeKey:                 armoredNodeKey,
+		NodeHashKey:             armoredHashKey,
+		NodePassphrase:          armoredPass,
+		NodePassphraseSignature: armoredPassSig,
+		SignatureAddress:        s.account,
+	}
+
+	_, err = s.client.CreateFolder(ctx, s.shareID, req)
+	if isAlreadyExistsError(err) {
+		s.meta.InvalidatePath(parent)
+		return ErrAlreadyExists
+	}
+	if err != nil {
+		s.meta.InvalidatePath(parent)
+		return fmt.Errorf("MakeDir: API: %w", err)
+	}
+
+	// Invalidate parent so subsequent ListDir reflects the new entry.
+	s.meta.InvalidatePath(parent)
+	return nil
 }
 
 // Move renames or moves a link.
@@ -697,6 +835,15 @@ func (s *Session) shareKeyRing(ctx context.Context) (*crypto.KeyRing, error) {
 	}
 	s.shareKR = kr
 	return kr, nil
+}
+
+// nodeKeyRing returns the cached keyring for link. Stat/resolvePath always
+// populates nodeKRs before returning, so a cache miss here is unexpected.
+func (s *Session) nodeKeyRing(_ context.Context, link proton.Link) (*crypto.KeyRing, error) {
+	if kr, ok := s.nodeKRs[link.LinkID]; ok {
+		return kr, nil
+	}
+	return nil, fmt.Errorf("node keyring not cached for link %s", link.LinkID)
 }
 
 // rootNodeKeyRing returns the node keyring for the root folder. Children's

@@ -29,7 +29,8 @@ const (
 	ErrAuthFailed = -32002
 	ErrNotAuthed  = -32003
 	ErrHVRequired = -32004 // human verification (CAPTCHA) needed
-	ErrOffline    = -32005 // network unreachable and no cached data available
+	ErrOffline       = -32005 // network unreachable and no cached data available
+	ErrAlreadyExists = -32006 // name already exists in parent directory
 )
 
 // HVDetails is embedded in RPCError.Details when Code == ErrHVRequired.
