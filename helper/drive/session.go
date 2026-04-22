@@ -642,7 +642,7 @@ func (s *Session) MakeDir(ctx context.Context, p string) error {
 	if _, err := rand.Read(rawHashKey); err != nil {
 		return fmt.Errorf("MakeDir: generate hash key: %w", err)
 	}
-	encHashKey, err := nodeKR.Encrypt(crypto.NewPlainMessage(rawHashKey), nil)
+	encHashKey, err := nodeKR.Encrypt(crypto.NewPlainMessage(rawHashKey), s.addrKR)
 	if err != nil {
 		return fmt.Errorf("MakeDir: encrypt hash key: %w", err)
 	}
