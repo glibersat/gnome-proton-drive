@@ -634,6 +634,26 @@ do_close_read (GVfsBackend      *backend,
   g_vfs_job_succeeded (G_VFS_JOB (job));
 }
 
+static void
+do_make_directory (GVfsBackend          *backend,
+                   GVfsJobMakeDirectory *job,
+                   const gchar          *filename)
+{
+  GVfsBackendProton *self = G_VFS_BACKEND_PROTON (backend);
+  GError *error = NULL;
+
+  if (!proton_rpc_make_directory (self->rpc, filename,
+                                   G_VFS_JOB (job)->cancellable,
+                                   &error))
+    {
+      g_vfs_job_failed_from_error (G_VFS_JOB (job), error);
+      g_error_free (error);
+      return;
+    }
+
+  g_vfs_job_succeeded (G_VFS_JOB (job));
+}
+
 /* ---------- GObject boilerplate ---------- */
 
 static void
@@ -666,6 +686,7 @@ g_vfs_backend_proton_class_init (GVfsBackendProtonClass *klass)
   backend_class->open_for_read      = do_open_for_read;
   backend_class->read               = do_read;
   backend_class->close_read         = do_close_read;
+  backend_class->make_directory     = do_make_directory;
   backend_class->create_dir_monitor  = do_create_dir_monitor;
   backend_class->create_file_monitor = do_create_file_monitor;
 }

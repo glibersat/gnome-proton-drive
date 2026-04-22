@@ -61,6 +61,13 @@ ProtonEntry  *proton_rpc_stat       (ProtonRpc    *rpc,
                                      GCancellable *cancellable,
                                      GError      **error);
 
+/* Create a directory at @path.  Returns TRUE on success.
+ * Sets error to G_IO_ERROR_EXISTS when the name already exists. */
+gboolean      proton_rpc_make_directory (ProtonRpc    *rpc,
+                                         const gchar  *path,
+                                         GCancellable *cancellable,
+                                         GError      **error);
+
 /* Read up to @length bytes from @path at @offset.
  * Returns the number of bytes read into @buf, or -1 on error.
  * Sets *@eof when the end of file has been reached. */

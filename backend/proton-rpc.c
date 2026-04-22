@@ -72,9 +72,21 @@ recv_response (ProtonRpc    *rpc,
 
   if (json_object_has_member (obj, "error"))
     {
-      JsonObject *err = json_object_get_object_member (obj, "error");
-      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED, "%s",
-                   json_object_get_string_member (err, "message"));
+      JsonObject *err  = json_object_get_object_member (obj, "error");
+      gint64      code = json_object_get_int_member (err, "code");
+      const gchar *msg = json_object_get_string_member (err, "message");
+
+      GIOErrorEnum gio_code;
+      switch (code)
+        {
+        case -32001: gio_code = G_IO_ERROR_NOT_FOUND;          break;
+        case -32002: gio_code = G_IO_ERROR_PERMISSION_DENIED;  break;
+        case -32003: gio_code = G_IO_ERROR_NOT_INITIALIZED;    break;
+        case -32005: gio_code = G_IO_ERROR_HOST_UNREACHABLE;   break;
+        case -32006: gio_code = G_IO_ERROR_EXISTS;             break;
+        default:     gio_code = G_IO_ERROR_FAILED;             break;
+        }
+      g_set_error_literal (error, G_IO_ERROR, gio_code, msg);
       return NULL;
     }
 
@@ -328,6 +340,22 @@ proton_rpc_stat (ProtonRpc    *rpc,
   if (json_object_has_member (e, "has_thumbnail"))
     ent->has_thumbnail = json_object_get_boolean_member (e, "has_thumbnail");
   return ent;
+}
+
+gboolean
+proton_rpc_make_directory (ProtonRpc    *rpc,
+                           const gchar  *path,
+                           GCancellable *cancellable,
+                           GError      **error)
+{
+  g_autoptr(JsonBuilder) b = json_builder_new ();
+  json_builder_begin_object (b);
+  json_builder_set_member_name (b, "path");
+  json_builder_add_string_value (b, path);
+  json_builder_end_object (b);
+
+  g_autoptr(JsonObject) resp = call (rpc, "Mkdir", b, cancellable, error);
+  return resp != NULL;
 }
 
 gssize
