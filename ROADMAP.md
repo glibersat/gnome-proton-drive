@@ -154,26 +154,27 @@ layers on every tree walk:
 - **`main.go` wiring** — `p.Offset` and `p.Length` are passed directly to
   `ReadFileContent`; the post-hoc byte slicing that existed there is removed.
 
-### B3. Write operations
-
-The API calls exist and their parameters are fully documented from the Windows
-client (see `docs/reference.md`).
+### B3. Write operations ✅ (partial)
 
 | Sub-task | API | Status |
 |---|---|---|
-| `Mkdir` | `POST /shares/{id}/folders` | Unblocked. `CreateFolder` exists in go-proton-api. Requires implementing crypto in the helper: generate `NodeKey` (Ed25519+X25519), random `NodePassphrase` (32 bytes), encrypt passphrase with parent `NodeKey`, compute `NameHash = HMAC-SHA256(hashKey, name)` — all doable with `gopenpgp`. |
-| `WriteFile` | `POST /shares/{id}/files` → `POST /blocks` → `PUT /revisions/{id}` | Unblocked. `CreateFile`, `RequestBlockUpload`, `UploadBlock`, and `UpdateRevision` all exist. Requires implementing block encryption (per-file `SessionKey`, PGP data packet, SHA-256 manifest) and the 3-concurrent upload pipeline using `gopenpgp`. |
+| `Mkdir` | `POST /shares/{id}/folders` | ✅ Done. |
+| `WriteFile` | `POST /shares/{id}/files` → `GET …/verification` → `POST /blocks` → `PUT /revisions/{id}` | ✅ Done. Buffer-then-upload; full E2E crypto matching Windows client. |
 | `Move` / `Rename` | `PUT /shares/{id}/links/{id}/move` | Blocked on upstream. `MoveLink` is missing from go-proton-api; passphrase re-encryption under new parent `NodeKey` and `NameHash` recomputation also needed. |
 
-Implement `Mkdir` and `WriteFile` in `drive/session.go` and register handlers
-in `main.go`. `Move` / `Rename` tracks against `go-proton-api` releases.
+**WriteFile implementation notes**
 
-**WriteFile upload strategy — buffer-then-upload (M3)**
-
-GVfs `WriteFile` streams bytes in chunks via `do_write` then calls `do_close_write`.
-The M3 implementation buffers all written bytes in a temp file and runs the full
-encrypt+upload pipeline on close. Simple and correct; maps naturally to the GVfs
-write handle model.
+- Block encryption uses `sk.Encrypt` (plain OpenPGP data packet) matching the
+  Windows and web clients.
+- `EncSignature` is `SignDetachedEncrypted` over the **plaintext** chunk, encrypted
+  with the node key. Signing the ciphertext (the original bug) made server-side
+  verification impossible.
+- `VerificationCode` is fetched from `GET …/revisions/{id}/verification` before
+  requesting upload URLs; `Verifier:{Token:XOR(code,enc[:N])}` is sent with each
+  block entry to pass the "outdated client" gate (API code 2000).
+- Orphaned draft links from interrupted uploads are detected via `LinkStateDraft`,
+  deleted with `DeleteChildren`, and `CreateFile` is retried with the same
+  already-generated crypto material.
 
 **Future: streaming pipeline (post-M3)**
 
@@ -328,7 +329,7 @@ overwrite. Revisit once revision history API is accessible.
 |---|---|---|---|
 | **M1 — Read-only mount** | A1 + A2 + B1 + C1 + C2 | Proton Drive visible in Nautilus; files openable read-only | ✅ Complete — volume monitor implemented; manual `gio mount` no longer required |
 | **M2 — Live updates** | B4 + C3 (remote→local) | Nautilus refreshes when remote changes | ✅ Complete — volume-level polling, anchor persistence, diff-based CREATED/DELETED, trash detection, and `HasMoreData` paging all working. Move/rename distinction deferred to M3 (B3 dependency) |
-| **M3 — Full read/write** | B3 + C1 (writes) + C3 | Create, edit, move, delete from Nautilus | In progress — `Mkdir` and `WriteFile` unblocked; `Move`/`Rename` blocked on `MoveLink` in go-proton-api |
+| **M3 — Full read/write** | B3 + C1 (writes) + C3 | Create, edit, move, delete from Nautilus | Partial — `Mkdir` ✅ and `WriteFile` ✅ working; `Move`/`Rename` blocked on `MoveLink` in go-proton-api |
 | **M4 — Settings panel** | A3-a or A3-b | Proton Drive in GNOME Settings → Online Accounts | Not started |
 | **M5 — Cache + offline** | C4 | Fast repeated access; reads served from disk when offline — *read-only tier done; pinning and write-queue pending* | Partial |
 

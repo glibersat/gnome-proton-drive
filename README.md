@@ -4,10 +4,9 @@
 > It exists out of personal frustration waiting for an official Linux client —
 > use it at your own risk.
 
-> **Alpha — read-only.** This project is in early development. Only browsing
-> and opening files is supported; no writes, moves, or deletes are exposed to
-> the file manager yet. Expect rough edges and breaking changes between
-> commits.
+> **Alpha.** This project is in early development. Reading, creating directories,
+> and uploading files are working; moves and renames are still pending upstream
+> support. Expect rough edges and breaking changes between commits.
 
 A native GNOME integration for Proton Drive, exposing it as a mounted volume
 in Nautilus and GTK file choosers.
@@ -169,9 +168,9 @@ See [docs/rpc-api.md](docs/rpc-api.md) for the full method and error code refere
 | Thumbnails (server-side, cached, shown in Nautilus) | ✅ |
 | GVfs C backend (read-only) | ✅ |
 | Delete / trash | ✅ (helper only — not exposed via GVfs yet) |
-| Create directory | ✅ Implemented (helper) — GVfs vtable pending |
+| Create directory | ✅ |
+| Write file | ✅ (buffer-then-upload; full E2E crypto + Verifier token) |
 | Move / rename | ⏳ Blocked on `MoveLink` in go-proton-api |
-| Write file | ⏳ Unblocked — block encryption + upload pipeline pending |
 | GNOME volume monitor | ✅ Implemented (libsecret + D-Bus watch, auto-appears in Nautilus) |
 | Event polling (remote → Nautilus) | ✅ Volume-level, anchor-persisted, full paging via `go-proton-api` |
 | Block cache re-encryption | 🔲 Currently stored as plaintext |
@@ -180,9 +179,9 @@ See [docs/rpc-api.md](docs/rpc-api.md) for the full method and error code refere
 
 ## Known limitations
 
-- **Read-only.** Write operations (`Mkdir`, `Move`, `WriteFile`) are stubbed
-  pending `go-proton-api` additions: key generation for new nodes, `MoveLink`,
-  and block upload helpers.
+- **No move / rename.** `MoveLink` is missing from go-proton-api; passphrase
+  re-encryption under the new parent `NodeKey` is also needed. Tracked in the
+  roadmap under B3.
 - **Volume monitor requires restart.** After `make install`, GIO must pick up
   the new `proton.monitor` descriptor. Log out and back in, or restart
   `gvfsd` and the volume monitor daemon.
