@@ -1,16 +1,19 @@
 package drive
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"net/url"
 	"os"
 	"path"
@@ -50,6 +53,7 @@ type Session struct {
 	auth      authState // rolling access token captured from the proton client
 	addrKR    *crypto.KeyRing            // primary address keyring
 	addrEmail string                     // email of the primary address (used as SignatureAddress)
+	addrID    string                     // ID of the primary address (used in BlockUploadReq)
 	shareKR  *crypto.KeyRing            // share keyring (unlocked with addrKR)
 	nodeKRs   map[string]*crypto.KeyRing // linkID → decrypted node keyring (cache)
 	linkPaths map[string]string          // linkID → absolute path (reverse map for event resolution)
@@ -115,7 +119,7 @@ func NewSession(ctx context.Context, mgr *proton.Manager, username, password str
 		return nil, SessionCredentials{}, err
 	}
 
-	addrKR, addrEmail, saltedPass, err := unlockPrimaryAddress(ctx, c, []byte(password))
+	addrKR, addrEmail, addrID, saltedPass, err := unlockPrimaryAddress(ctx, c, []byte(password))
 	if err != nil {
 		_ = c.AuthDelete(ctx)
 		return nil, SessionCredentials{}, err
@@ -132,7 +136,7 @@ func NewSession(ctx context.Context, mgr *proton.Manager, username, password str
 		RefreshToken:     auth.RefreshToken,
 		SaltedPassphrase: saltedPass,
 	}
-	s := newSession(c, shareID, volumeID, rootID, username, addrEmail, addrKR)
+	s := newSession(c, shareID, volumeID, rootID, username, addrEmail, addrID, addrKR)
 	s.setAuth(auth.UID, auth.AccessToken)
 	return s, creds, nil
 }
@@ -150,7 +154,7 @@ func NewSessionWithHV(ctx context.Context, mgr *proton.Manager, username, passwo
 		return nil, SessionCredentials{}, err
 	}
 
-	addrKR, addrEmail, saltedPass, err := unlockPrimaryAddress(ctx, c, []byte(password))
+	addrKR, addrEmail, addrID, saltedPass, err := unlockPrimaryAddress(ctx, c, []byte(password))
 	if err != nil {
 		_ = c.AuthDelete(ctx)
 		return nil, SessionCredentials{}, err
@@ -167,7 +171,7 @@ func NewSessionWithHV(ctx context.Context, mgr *proton.Manager, username, passwo
 		RefreshToken:     auth.RefreshToken,
 		SaltedPassphrase: saltedPass,
 	}
-	s := newSession(c, shareID, volumeID, rootID, username, addrEmail, addrKR)
+	s := newSession(c, shareID, volumeID, rootID, username, addrEmail, addrID, addrKR)
 	s.setAuth(auth.UID, auth.AccessToken)
 	return s, creds, nil
 }
@@ -182,7 +186,7 @@ func ResumeSession(ctx context.Context, mgr *proton.Manager, creds SessionCreden
 		return nil, SessionCredentials{}, fmt.Errorf("token refresh failed: %w", err)
 	}
 
-	addrKR, addrEmail, err := unlockWithSaltedPassphrase(ctx, c, creds.SaltedPassphrase)
+	addrKR, addrEmail, addrID, err := unlockWithSaltedPassphrase(ctx, c, creds.SaltedPassphrase)
 	if err != nil {
 		_ = c.AuthDelete(ctx)
 		return nil, SessionCredentials{}, err
@@ -203,7 +207,7 @@ func ResumeSession(ctx context.Context, mgr *proton.Manager, creds SessionCreden
 		RefreshToken:     auth.RefreshToken,
 		SaltedPassphrase: creds.SaltedPassphrase,
 	}
-	s := newSession(c, shareID, volumeID, rootID, account, addrEmail, addrKR)
+	s := newSession(c, shareID, volumeID, rootID, account, addrEmail, addrID, addrKR)
 	s.setAuth(auth.UID, auth.AccessToken)
 	return s, newCreds, nil
 }
@@ -211,7 +215,7 @@ func ResumeSession(ctx context.Context, mgr *proton.Manager, creds SessionCreden
 // newSession is the single place where Session is constructed.  It
 // initialises the metadata cache and, if the cache directory is reachable, the
 // persistent block cache.
-func newSession(c *proton.Client, shareID, volumeID, rootID, account, addrEmail string, addrKR *crypto.KeyRing) *Session {
+func newSession(c *proton.Client, shareID, volumeID, rootID, account, addrEmail, addrID string, addrKR *crypto.KeyRing) *Session {
 	s := &Session{
 		client:    c,
 		shareID:   shareID,
@@ -219,6 +223,7 @@ func newSession(c *proton.Client, shareID, volumeID, rootID, account, addrEmail 
 		rootID:    rootID,
 		account:   account,
 		addrEmail: addrEmail,
+		addrID:    addrID,
 		apiBase:   proton.DefaultHostURL,
 		addrKR:    addrKR,
 		nodeKRs:   make(map[string]*crypto.KeyRing),
@@ -556,9 +561,14 @@ func sliceRange(buf []byte, startBlock0 int, offset, length int64) []byte {
 var ErrAlreadyExists = errors.New("already exists")
 
 // isAlreadyExistsError returns true when the Proton API reports code 2500.
+// The real API returns *proton.APIError (pointer); tests use proton.APIError (value).
 func isAlreadyExistsError(err error) bool {
-	var apiErr proton.APIError
-	return errors.As(err, &apiErr) && apiErr.Code == 2500
+	var pErr *proton.APIError
+	if errors.As(err, &pErr) {
+		return pErr.Code == 2500
+	}
+	var vErr proton.APIError
+	return errors.As(err, &vErr) && vErr.Code == 2500
 }
 
 // MakeDir creates a folder at the given path.
@@ -695,6 +705,520 @@ func (s *Session) MakeDir(ctx context.Context, p string) error {
 	return nil
 }
 
+// protonBlockUploadSize is the maximum plaintext size of a single Proton Drive block.
+const protonBlockUploadSize = 4 * 1024 * 1024 // 4 MiB
+
+// getVerificationCode fetches the server-generated verification code for a
+// revision. The code is XORed with the first N bytes of each encrypted block
+// to produce the Verifier token that must accompany block upload requests.
+// Endpoint: GET /drive/shares/{shareID}/links/{linkID}/revisions/{revisionID}/verification
+func (s *Session) getVerificationCode(ctx context.Context, linkID, revisionID string) ([]byte, error) {
+	uid, bearer := s.currentAuth()
+	url := fmt.Sprintf("%s/drive/shares/%s/links/%s/revisions/%s/verification",
+		s.apiBase, s.shareID, linkID, revisionID)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	setProtonHeaders(httpReq, uid, bearer)
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var result struct {
+		Code             int
+		Error            string
+		VerificationCode []byte `json:"VerificationCode"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("getVerificationCode: decode: %w", err)
+	}
+	if result.Code != 1000 {
+		return nil, fmt.Errorf("getVerificationCode: API code %d: %s", result.Code, result.Error)
+	}
+	return result.VerificationCode, nil
+}
+
+// requestBlockUpload posts req to /drive/blocks and returns the upload links.
+// This bypasses go-proton-api's RequestBlockUpload which sends ShareID; the
+// current Proton API requires VolumeID instead.
+func (s *Session) requestBlockUpload(ctx context.Context, req any) ([]proton.BlockUploadLink, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	uid, bearer := s.currentAuth()
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		s.apiBase+"/drive/blocks", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	setProtonHeaders(httpReq, uid, bearer)
+	log.Printf("requestBlockUpload: POST %s body=%s", httpReq.URL, body)
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("requestBlockUpload: status=%d body=%s", resp.StatusCode, respBody)
+	var result struct {
+		Code        int
+		Error       string
+		UploadLinks []proton.BlockUploadLink
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return nil, fmt.Errorf("requestBlockUpload: decode response: %w", err)
+	}
+	if result.Code != 1000 {
+		return nil, fmt.Errorf("requestBlockUpload: API code %d: %s", result.Code, result.Error)
+	}
+	return result.UploadLinks, nil
+}
+
+// updateRevision finalises a draft revision by PUTting the manifest signature.
+// Matches the current Proton Drive API which no longer accepts BlockList/State.
+func (s *Session) updateRevision(ctx context.Context, linkID, revisionID, manifestSig string) error {
+	type req struct {
+		ManifestSignature string `json:"ManifestSignature"`
+		SignatureAddress  string `json:"SignatureAddress"`
+		XAttr             string `json:"XAttr,omitempty"`
+	}
+	body, err := json.Marshal(req{
+		ManifestSignature: manifestSig,
+		SignatureAddress:  s.addrEmail,
+	})
+	if err != nil {
+		return err
+	}
+	uid, bearer := s.currentAuth()
+	url := fmt.Sprintf("%s/drive/shares/%s/files/%s/revisions/%s", s.apiBase, s.shareID, linkID, revisionID)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	setProtonHeaders(httpReq, uid, bearer)
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	log.Printf("updateRevision: status=%d body=%s", resp.StatusCode, respBody)
+	var result struct {
+		Code  int
+		Error string
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return fmt.Errorf("decode: %w", err)
+	}
+	if result.Code != 1000 {
+		return fmt.Errorf("API code %d: %s", result.Code, result.Error)
+	}
+	return nil
+}
+
+// byteStream wraps a byte slice so it implements resty's MultiPartStream interface.
+type byteStream struct{ r *bytes.Reader }
+
+func (b byteStream) GetMultipartReader() io.Reader { return b.r }
+
+// createRevision creates a new draft revision for an existing file link.
+// It posts to /drive/shares/{shareID}/files/{linkID}/revisions and returns the new revisionID.
+func (s *Session) createRevision(ctx context.Context, linkID, currentRevisionID string) (string, error) {
+	type req struct {
+		CurrentRevisionID string `json:"CurrentRevisionID,omitempty"`
+	}
+	body, err := json.Marshal(req{CurrentRevisionID: currentRevisionID})
+	if err != nil {
+		return "", err
+	}
+	uid, bearer := s.currentAuth()
+	url := fmt.Sprintf("%s/drive/shares/%s/files/%s/revisions", s.apiBase, s.shareID, linkID)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	setProtonHeaders(httpReq, uid, bearer)
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var result struct {
+		Code     int
+		Error    string
+		Revision struct{ ID string }
+		Details  struct {
+			DraftRevisionID string
+		}
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("createRevision: decode: %w", err)
+	}
+	if result.Code == 1000 {
+		return result.Revision.ID, nil
+	}
+	// Code=2500 with a conflict: return the existing draft revision ID.
+	if result.Details.DraftRevisionID != "" {
+		return result.Details.DraftRevisionID, nil
+	}
+	return "", fmt.Errorf("createRevision: API code %d: %s", result.Code, result.Error)
+}
+
+// WriteFile creates (or overwrites) a file at the given path with data.
+// mimeType should be the MIME type of the content; if empty, "application/octet-stream" is used.
+// The buffer-then-upload strategy is used: data is encrypted in 4 MiB blocks,
+// all blocks are requested in a single RequestBlockUpload call, then uploaded.
+func (s *Session) WriteFile(ctx context.Context, p, mimeType string, data []byte) error {
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+	p = path.Clean("/" + p)
+	parent := path.Dir(p)
+	name := path.Base(p)
+
+	parentLink, _, err := s.Stat(ctx, parent)
+	if err != nil {
+		return err
+	}
+	parentKR, err := s.nodeKeyRing(ctx, parentLink)
+	if err != nil {
+		return fmt.Errorf("WriteFile: parent keyring: %w", err)
+	}
+
+	hashKey, err := parentLink.GetHashKey(parentKR)
+	if err != nil {
+		return fmt.Errorf("WriteFile: hash key: %w", err)
+	}
+
+	// Node key and passphrase (same pattern as MakeDir).
+	nodeKey, err := crypto.GenerateKey(s.addrEmail, s.addrEmail, "x25519", 0)
+	if err != nil {
+		return fmt.Errorf("WriteFile: generate node key: %w", err)
+	}
+	rawPass := make([]byte, 32)
+	if _, err := rand.Read(rawPass); err != nil {
+		return fmt.Errorf("WriteFile: generate passphrase: %w", err)
+	}
+	passB64 := base64.StdEncoding.EncodeToString(rawPass)
+	lockedKey, err := nodeKey.Lock([]byte(passB64))
+	if err != nil {
+		return fmt.Errorf("WriteFile: lock node key: %w", err)
+	}
+	armoredNodeKey, err := lockedKey.Armor()
+	if err != nil {
+		return fmt.Errorf("WriteFile: armor node key: %w", err)
+	}
+	encPass, err := parentKR.Encrypt(crypto.NewPlainMessageFromString(passB64), nil)
+	if err != nil {
+		return fmt.Errorf("WriteFile: encrypt passphrase: %w", err)
+	}
+	armoredPass, err := encPass.GetArmored()
+	if err != nil {
+		return fmt.Errorf("WriteFile: armor passphrase: %w", err)
+	}
+	passSig, err := s.addrKR.SignDetached(crypto.NewPlainMessageFromString(passB64))
+	if err != nil {
+		return fmt.Errorf("WriteFile: sign passphrase: %w", err)
+	}
+	armoredPassSig, err := passSig.GetArmored()
+	if err != nil {
+		return fmt.Errorf("WriteFile: armor passphrase sig: %w", err)
+	}
+
+	nodeKR, err := crypto.NewKeyRing(nodeKey)
+	if err != nil {
+		return fmt.Errorf("WriteFile: new node keyring: %w", err)
+	}
+
+	// Session key for block encryption.
+	sk, err := crypto.GenerateSessionKey()
+	if err != nil {
+		return fmt.Errorf("WriteFile: generate session key: %w", err)
+	}
+
+	// Encrypt session key with the node keyring → ContentKeyPacket.
+	keyPacket, err := nodeKR.EncryptSessionKey(sk)
+	if err != nil {
+		return fmt.Errorf("WriteFile: encrypt session key: %w", err)
+	}
+	contentKeyPacket := base64.StdEncoding.EncodeToString(keyPacket)
+
+	// Sign the session key bytes with the node keyring → ContentKeyPacketSignature.
+	skSig, err := nodeKR.SignDetached(crypto.NewPlainMessage(sk.Key))
+	if err != nil {
+		return fmt.Errorf("WriteFile: sign session key: %w", err)
+	}
+	contentKeyPacketSig, err := skSig.GetArmored()
+	if err != nil {
+		return fmt.Errorf("WriteFile: armor session key sig: %w", err)
+	}
+
+	// Encrypted name and hash.
+	encName, err := parentKR.Encrypt(crypto.NewPlainMessageFromString(name), s.addrKR)
+	if err != nil {
+		return fmt.Errorf("WriteFile: encrypt name: %w", err)
+	}
+	armoredName, err := encName.GetArmored()
+	if err != nil {
+		return fmt.Errorf("WriteFile: armor name: %w", err)
+	}
+	mac := hmac.New(sha256.New, hashKey)
+	mac.Write([]byte(name))
+	nameHash := hex.EncodeToString(mac.Sum(nil))
+
+	// Create the file link (draft revision). Store the request so we can retry
+	// it after cleaning up an orphaned draft link if needed.
+	createReq := proton.CreateFileReq{
+		ParentLinkID:              parentLink.LinkID,
+		Name:                      armoredName,
+		Hash:                      nameHash,
+		MIMEType:                  mimeType,
+		ContentKeyPacket:          contentKeyPacket,
+		ContentKeyPacketSignature: contentKeyPacketSig,
+		NodeKey:                   armoredNodeKey,
+		NodePassphrase:            armoredPass,
+		NodePassphraseSignature:   armoredPassSig,
+		SignatureAddress:          s.addrEmail,
+	}
+	log.Printf("WriteFile: CreateFile shareID=%s parent=%s name=%s", s.shareID, parentLink.LinkID, name)
+	fileRes, err := s.client.CreateFile(ctx, s.shareID, createReq)
+
+	var linkID, revisionID string
+	if isAlreadyExistsError(err) {
+		// A link with this name already exists — either an active file that we
+		// should overwrite with a new revision, or an orphaned draft from a
+		// previous interrupted upload.
+		//
+		// Draft links are excluded from ListChildren(showAll=false), so invalidate
+		// the parent cache and search with showAll=true if the normal Stat fails.
+		log.Printf("WriteFile: name conflict at %s, resolving", p)
+		s.meta.InvalidatePath(parent)
+
+		existingLink, existingParentKR, statErr := s.Stat(ctx, p)
+		if statErr != nil {
+			existingLink, existingParentKR, statErr = s.findLinkIncludingDrafts(ctx, parentLink.LinkID, parent, name, parentKR)
+			if statErr != nil {
+				return fmt.Errorf("WriteFile: find existing (including drafts): %w", statErr)
+			}
+		}
+
+		if existingLink.State == proton.LinkStateDraft {
+			// Orphaned draft from a previous interrupted upload. The API rejects
+			// createRevision for draft links (2501). Delete it and start fresh
+			// with the same crypto material that was already generated above.
+			log.Printf("WriteFile: deleting orphaned draft link %s", existingLink.LinkID)
+			if delErr := s.client.DeleteChildren(ctx, s.shareID, parentLink.LinkID, existingLink.LinkID); delErr != nil {
+				log.Printf("WriteFile: delete draft link: %v (proceeding anyway)", delErr)
+			}
+			s.meta.InvalidatePath(parent)
+			fileRes, err = s.client.CreateFile(ctx, s.shareID, createReq)
+			if err != nil {
+				return fmt.Errorf("WriteFile: CreateFile after draft cleanup: %w", err)
+			}
+			linkID = fileRes.ID
+			revisionID = fileRes.RevisionID
+		} else {
+			// Active link — recover its session key and upload a new revision.
+			existingNodeKR, krErr := existingLink.GetKeyRing(existingParentKR, s.addrKR)
+			if krErr != nil {
+				return fmt.Errorf("WriteFile: existing node keyring: %w", krErr)
+			}
+			s.nodeKRs[existingLink.LinkID] = existingNodeKR
+			if existingLink.FileProperties == nil {
+				return fmt.Errorf("WriteFile: existing link has no file properties")
+			}
+			kpBytes, decErr := base64.StdEncoding.DecodeString(existingLink.FileProperties.ContentKeyPacket)
+			if decErr != nil {
+				return fmt.Errorf("WriteFile: decode existing key packet: %w", decErr)
+			}
+			sk, err = existingNodeKR.DecryptSessionKey(kpBytes)
+			if err != nil {
+				return fmt.Errorf("WriteFile: decrypt existing session key: %w", err)
+			}
+			nodeKR = existingNodeKR
+			linkID = existingLink.LinkID
+			currentRevID := ""
+			if existingLink.FileProperties.ActiveRevision.ID != "" {
+				currentRevID = existingLink.FileProperties.ActiveRevision.ID
+			}
+			revisionID, err = s.createRevision(ctx, linkID, currentRevID)
+			if err != nil {
+				return fmt.Errorf("WriteFile: createRevision: %w", err)
+			}
+		}
+	} else if err != nil {
+		s.meta.InvalidatePath(parent)
+		return fmt.Errorf("WriteFile: CreateFile: %w", err)
+	} else {
+		linkID = fileRes.ID
+		revisionID = fileRes.RevisionID
+	}
+
+	// Split data into 4 MiB blocks, encrypt each with the session key.
+	type encBlock struct {
+		enc  []byte
+		hash string // SHA-256 of encrypted block, base64
+		sig  string // armored encrypted-and-signed signature for block
+	}
+	var blocks []encBlock
+	for i := 0; ; i++ {
+		start := i * protonBlockUploadSize
+		if start >= len(data) {
+			break
+		}
+		end := start + protonBlockUploadSize
+		if end > len(data) {
+			end = len(data)
+		}
+		chunk := data[start:end]
+
+		enc, err := sk.Encrypt(crypto.NewPlainMessage(chunk))
+		if err != nil {
+			return fmt.Errorf("WriteFile: encrypt block %d: %w", i, err)
+		}
+
+		h := sha256.Sum256(enc)
+		hashB64 := base64.StdEncoding.EncodeToString(h[:])
+
+		// Sign the plaintext block with the address keyring, encrypt the signature with the node key.
+		// The server verifies this signature against the decrypted plaintext.
+		encSig, err := s.addrKR.SignDetachedEncrypted(crypto.NewPlainMessage(chunk), nodeKR)
+		if err != nil {
+			return fmt.Errorf("WriteFile: sign block %d: %w", i, err)
+		}
+		encSigB64, err := encSig.GetArmored()
+		if err != nil {
+			return fmt.Errorf("WriteFile: armor block sig %d: %w", i, err)
+		}
+
+		blocks = append(blocks, encBlock{enc: enc, hash: hashB64, sig: encSigB64})
+	}
+
+	// Handle zero-byte file: still need at least one block entry (empty).
+	if len(blocks) == 0 {
+		enc, err := sk.Encrypt(crypto.NewPlainMessage(nil))
+		if err != nil {
+			return fmt.Errorf("WriteFile: encrypt empty block: %w", err)
+		}
+		h := sha256.Sum256(enc)
+		hashB64 := base64.StdEncoding.EncodeToString(h[:])
+		encSig, err := s.addrKR.SignDetachedEncrypted(crypto.NewPlainMessage(nil), nodeKR)
+		if err != nil {
+			return fmt.Errorf("WriteFile: sign empty block: %w", err)
+		}
+		encSigB64, err := encSig.GetArmored()
+		if err != nil {
+			return fmt.Errorf("WriteFile: armor empty block sig: %w", err)
+		}
+		blocks = append(blocks, encBlock{enc: enc, hash: hashB64, sig: encSigB64})
+	}
+
+	// Fetch the server-generated verification code. It is XORed with the first
+	// N bytes of each encrypted block to produce the Verifier token that the
+	// current API requires; its absence triggers the "outdated client" gate.
+	verificationCode, err := s.getVerificationCode(ctx, linkID, revisionID)
+	if err != nil {
+		return fmt.Errorf("WriteFile: getVerificationCode: %w", err)
+	}
+
+	// verifierToken computes XOR(verificationCode, encryptedBlock[:N]).
+	verifierToken := func(enc []byte) []byte {
+		n := len(verificationCode)
+		if n > len(enc) {
+			n = len(enc)
+		}
+		token := make([]byte, len(verificationCode))
+		for i := 0; i < n; i++ {
+			token[i] = verificationCode[i] ^ enc[i]
+		}
+		// Remaining bytes stay zero (padding as per protocol).
+		return token
+	}
+
+	// Request upload URLs for all blocks in one call.
+	// go-proton-api's BlockUploadReq sends ShareID, but the Proton API now
+	// requires VolumeID. Build the request body manually.
+	type blockVerifier struct {
+		Token []byte `json:"Token"`
+	}
+	type blockUploadInfoV2 struct {
+		Index        int           `json:"Index"`
+		Size         int           `json:"Size"`
+		EncSignature string        `json:"EncSignature"`
+		Hash         string        `json:"Hash"`
+		Verifier     blockVerifier `json:"Verifier"`
+	}
+	type blockUploadReqV2 struct {
+		AddressID     string              `json:"AddressID"`
+		VolumeID      string              `json:"VolumeID"`
+		LinkID        string              `json:"LinkID"`
+		RevisionID    string              `json:"RevisionID"`
+		BlockList     []blockUploadInfoV2 `json:"BlockList"`
+		ThumbnailList []struct{}          `json:"ThumbnailList"`
+	}
+	blockInfosV2 := make([]blockUploadInfoV2, len(blocks))
+	for i, b := range blocks {
+		blockInfosV2[i] = blockUploadInfoV2{
+			Index:        i + 1,
+			Size:         len(b.enc),
+			EncSignature: b.sig,
+			Hash:         b.hash,
+			Verifier:     blockVerifier{Token: verifierToken(b.enc)},
+		}
+	}
+	uploadLinks, err := s.requestBlockUpload(ctx, blockUploadReqV2{
+		AddressID:     s.addrID,
+		VolumeID:      s.volumeID,
+		LinkID:        linkID,
+		RevisionID:    revisionID,
+		BlockList:     blockInfosV2,
+		ThumbnailList: []struct{}{},
+	})
+	if err != nil {
+		return fmt.Errorf("WriteFile: RequestBlockUpload: %w", err)
+	}
+
+	// Upload each block.
+	for i, ul := range uploadLinks {
+		// resty.MultiPartStream wraps an io.ReadSeeker.
+		enc := blocks[i].enc
+		if err := s.client.UploadBlock(ctx, ul.BareURL, ul.Token, byteStream{r: bytes.NewReader(enc)}); err != nil {
+			return fmt.Errorf("WriteFile: UploadBlock %d: %w", i, err)
+		}
+	}
+
+	// Build manifest: SHA-256 over all block hashes (base64 decoded → raw → concatenated).
+	var manifestBuf []byte
+	for _, b := range blocks {
+		raw, _ := base64.StdEncoding.DecodeString(b.hash)
+		manifestBuf = append(manifestBuf, raw...)
+	}
+	manifestSig, err := s.addrKR.SignDetached(crypto.NewPlainMessage(manifestBuf))
+	if err != nil {
+		return fmt.Errorf("WriteFile: sign manifest: %w", err)
+	}
+	manifestSigArmored, err := manifestSig.GetArmored()
+	if err != nil {
+		return fmt.Errorf("WriteFile: armor manifest sig: %w", err)
+	}
+
+	if err := s.updateRevision(ctx, linkID, revisionID, manifestSigArmored); err != nil {
+		return fmt.Errorf("WriteFile: UpdateRevision: %w", err)
+	}
+
+	s.meta.InvalidatePath(parent)
+	return nil
+}
+
 // Move renames or moves a link.
 // TODO: go-proton-api does not yet expose a MoveLink endpoint.
 func (s *Session) Move(_ context.Context, _, _ string) error {
@@ -824,6 +1348,27 @@ func (s *Session) parentKRFor(ctx context.Context, p string) (*crypto.KeyRing, e
 	return kr, err
 }
 
+// findLinkIncludingDrafts searches the parent folder for a child whose decrypted
+// name equals name, including draft links (State=0) that are excluded from
+// ListChildren(showAll=false). Used to recover from CreateFile 2500 conflicts
+// caused by a previous interrupted upload that left a draft link behind.
+func (s *Session) findLinkIncludingDrafts(ctx context.Context, parentLinkID, parentPath, name string, parentKR *crypto.KeyRing) (proton.Link, *crypto.KeyRing, error) {
+	children, err := s.client.ListChildren(ctx, s.shareID, parentLinkID, true)
+	if err != nil {
+		return proton.Link{}, nil, fmt.Errorf("list (showAll): %w", err)
+	}
+	for _, l := range children {
+		n, err := l.GetName(parentKR, s.addrKR)
+		if err != nil {
+			continue
+		}
+		if n == name {
+			return l, parentKR, nil
+		}
+	}
+	return proton.Link{}, nil, fmt.Errorf("not found (including drafts): %s/%s", parentPath, name)
+}
+
 // shareKeyRing returns the keyring for the Drive share itself (used to unlock
 // the root node key). Cached after first fetch.
 func (s *Session) shareKeyRing(ctx context.Context) (*crypto.KeyRing, error) {
@@ -885,55 +1430,55 @@ func splitPath(p string) []string {
 // unlockPrimaryAddress derives the salted passphrase from the raw password,
 // unlocks the address keyring, and returns both so the passphrase can be
 // stored in the keyring for future passwordless resumes.
-func unlockPrimaryAddress(ctx context.Context, c *proton.Client, password []byte) (*crypto.KeyRing, string, []byte, error) {
+func unlockPrimaryAddress(ctx context.Context, c *proton.Client, password []byte) (*crypto.KeyRing, string, string, []byte, error) {
 	user, err := c.GetUser(ctx)
 	if err != nil {
-		return nil, "", nil, err
+		return nil, "", "", nil, err
 	}
 
 	salts, err := c.GetSalts(ctx)
 	if err != nil {
-		return nil, "", nil, err
+		return nil, "", "", nil, err
 	}
 
 	saltedPass, err := salts.SaltForKey(password, user.Keys[0].ID)
 	if err != nil {
-		return nil, "", nil, err
+		return nil, "", "", nil, err
 	}
 
-	kr, email, err := unlockWithSaltedPassphrase(ctx, c, saltedPass)
+	kr, email, addrID, err := unlockWithSaltedPassphrase(ctx, c, saltedPass)
 	if err != nil {
-		return nil, "", nil, err
+		return nil, "", "", nil, err
 	}
-	return kr, email, saltedPass, nil
+	return kr, email, addrID, saltedPass, nil
 }
 
 // unlockWithSaltedPassphrase restores the address keyring from the stored
 // salted passphrase — no raw password needed.
-// Also returns the email of the primary unlocked address for use as SignatureAddress.
-func unlockWithSaltedPassphrase(ctx context.Context, c *proton.Client, saltedPass []byte) (*crypto.KeyRing, string, error) {
+// Also returns the email and ID of the primary unlocked address.
+func unlockWithSaltedPassphrase(ctx context.Context, c *proton.Client, saltedPass []byte) (*crypto.KeyRing, string, string, error) {
 	user, err := c.GetUser(ctx)
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
 
 	addrs, err := c.GetAddresses(ctx)
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
 
 	_, addrKRs, err := proton.Unlock(user, addrs, saltedPass, async.NoopPanicHandler{})
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
 
 	for _, addr := range addrs {
 		if kr, ok := addrKRs[addr.ID]; ok {
-			return kr, addr.Email, nil
+			return kr, addr.Email, addr.ID, nil
 		}
 	}
 
-	return nil, "", fmt.Errorf("no address keyring found")
+	return nil, "", "", fmt.Errorf("no address keyring found")
 }
 
 func findMainShare(ctx context.Context, c *proton.Client) (shareID, volumeID, rootID string, err error) {

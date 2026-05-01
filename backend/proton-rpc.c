@@ -358,6 +358,34 @@ proton_rpc_make_directory (ProtonRpc    *rpc,
   return resp != NULL;
 }
 
+gboolean
+proton_rpc_write_file (ProtonRpc    *rpc,
+                       const gchar  *path,
+                       const gchar  *mime_type,
+                       const guchar *data,
+                       gsize         data_len,
+                       GCancellable *cancellable,
+                       GError      **error)
+{
+  g_autofree gchar *b64 = g_base64_encode (data, data_len);
+
+  g_autoptr(JsonBuilder) b = json_builder_new ();
+  json_builder_begin_object (b);
+  json_builder_set_member_name (b, "path");
+  json_builder_add_string_value (b, path);
+  if (mime_type && *mime_type)
+    {
+      json_builder_set_member_name (b, "mime_type");
+      json_builder_add_string_value (b, mime_type);
+    }
+  json_builder_set_member_name (b, "data");
+  json_builder_add_string_value (b, b64);
+  json_builder_end_object (b);
+
+  g_autoptr(JsonObject) resp = call (rpc, "WriteFile", b, cancellable, error);
+  return resp != NULL;
+}
+
 gssize
 proton_rpc_read_file (ProtonRpc    *rpc,
                       const gchar  *path,

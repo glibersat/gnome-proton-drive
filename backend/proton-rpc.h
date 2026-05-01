@@ -68,6 +68,18 @@ gboolean      proton_rpc_make_directory (ProtonRpc    *rpc,
                                          GCancellable *cancellable,
                                          GError      **error);
 
+/* Create or overwrite @path with @data_len bytes from @data.
+ * @mime_type may be NULL or empty to default to application/octet-stream.
+ * Returns TRUE on success.  Sets error to G_IO_ERROR_EXISTS if the name
+ * already exists in the parent directory. */
+gboolean      proton_rpc_write_file (ProtonRpc    *rpc,
+                                     const gchar  *path,
+                                     const gchar  *mime_type,
+                                     const guchar *data,
+                                     gsize         data_len,
+                                     GCancellable *cancellable,
+                                     GError      **error);
+
 /* Read up to @length bytes from @path at @offset.
  * Returns the number of bytes read into @buf, or -1 on error.
  * Sets *@eof when the end of file has been reached. */

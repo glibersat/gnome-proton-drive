@@ -59,7 +59,7 @@ func main() {
 	}
 	defer ln.Close()
 
-	mgr := proton.New(proton.WithAppVersion("web-drive@5.0.0"))
+	mgr := proton.New(proton.WithAppVersion("windows-drive@1.13.1"))
 	srv := rpc.NewServer()
 
 	var session *drive.Session
@@ -315,6 +315,24 @@ func main() {
 			return rpc.FetchThumbnailResult{}, nil
 		}
 		return rpc.FetchThumbnailResult{Path: thumbPath}, nil
+	})
+
+	srv.Register("WriteFile", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		s, err := requireSession()
+		if err != nil {
+			return nil, err
+		}
+		var p rpc.WriteFileParams
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, &rpc.RPCError{Code: rpc.ErrInvalidArg, Message: err.Error()}
+		}
+		if err := s.WriteFile(ctx, p.Path, p.MIMEType, p.Data); err != nil {
+			if errors.Is(err, drive.ErrAlreadyExists) {
+				return nil, &rpc.RPCError{Code: rpc.ErrAlreadyExists, Message: err.Error()}
+			}
+			return nil, err
+		}
+		return nil, nil
 	})
 
 	srv.Register("Mkdir", func(ctx context.Context, raw json.RawMessage) (any, error) {

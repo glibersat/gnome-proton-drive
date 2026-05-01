@@ -200,5 +200,5 @@ func downloadThumbnailBlock(ctx context.Context, block thumbnailBlockInfo) ([]by
 func setProtonHeaders(r *http.Request, uid, bearer string) {
 	r.Header.Set("x-pm-uid", uid)
 	r.Header.Set("Authorization", "Bearer "+bearer)
-	r.Header.Set("x-pm-appversion", "web-drive@5.0.0")
+	r.Header.Set("x-pm-appversion", "windows-drive@1.13.1")
 }

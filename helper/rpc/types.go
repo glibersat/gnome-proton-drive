@@ -159,6 +159,12 @@ type FetchThumbnailResult struct {
 	Path string `json:"path"`
 }
 
+type WriteFileParams struct {
+	Path     string `json:"path"`
+	MIMEType string `json:"mime_type,omitempty"`
+	Data     []byte `json:"data"`
+}
+
 type MkdirParams struct{ Path string `json:"path"` }
 
 type DeleteParams struct {

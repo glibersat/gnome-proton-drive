@@ -1,7 +1,6 @@
 package rpc
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"log"
@@ -41,17 +40,18 @@ func (s *Server) handleConn(conn net.Conn) {
 	enc := json.NewEncoder(conn)
 	reqs := make(chan Request)
 
-	// Scanner goroutine: reads requests and cancels ctx when the connection
-	// closes, which propagates into any in-flight handler (e.g. block reads).
+	// Reader goroutine: decodes newline-delimited JSON requests and cancels
+	// ctx when the connection closes, propagating into any in-flight handler.
+	// json.Decoder has no line-length limit, unlike bufio.Scanner (64 KiB
+	// default), which is necessary for WriteFile with large payloads.
 	go func() {
 		defer cancel()
 		defer close(reqs)
-		scanner := bufio.NewScanner(conn)
-		for scanner.Scan() {
+		dec := json.NewDecoder(conn)
+		for {
 			var req Request
-			if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
-				log.Printf("malformed request: %v", err)
-				continue
+			if err := dec.Decode(&req); err != nil {
+				return
 			}
 			reqs <- req
 		}

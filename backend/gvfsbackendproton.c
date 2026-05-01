@@ -8,6 +8,9 @@
 #include <gvfsjobopenforread.h>
 #include <gvfsjobread.h>
 #include <gvfsjobcloseread.h>
+#include <gvfsjobopenforwrite.h>
+#include <gvfsjobwrite.h>
+#include <gvfsjobclosewrite.h>
 #include <gvfsmonitor.h>
 #include <gvfsjobcreatemonitor.h>
 
@@ -19,6 +22,13 @@ typedef struct {
   gchar  *path;
   gint64  offset;
 } ProtonHandle;
+
+/* Per-create handle: accumulates written data until do_close_write uploads. */
+typedef struct {
+  gchar      *path;
+  gchar      *mime_type;
+  GByteArray *buf;
+} ProtonWriteHandle;
 
 /* Weak-reference wrapper for a GVfsMonitor stored in self->monitors.
  * monitor is zeroed by GLib when the underlying object is finalised. */
@@ -635,6 +645,68 @@ do_close_read (GVfsBackend      *backend,
 }
 
 static void
+do_create (GVfsBackend         *backend,
+           GVfsJobOpenForWrite *job,
+           const gchar         *filename,
+           GFileCreateFlags     flags)
+{
+  ProtonWriteHandle *h = g_new0 (ProtonWriteHandle, 1);
+  h->path      = g_strdup (filename);
+  h->mime_type = g_strdup ("");
+  h->buf       = g_byte_array_new ();
+  g_vfs_job_open_for_write_set_handle (job, h);
+  g_vfs_job_open_for_write_set_can_seek (job, FALSE);
+  g_vfs_job_open_for_write_set_can_truncate (job, FALSE);
+  g_vfs_job_succeeded (G_VFS_JOB (job));
+}
+
+static void
+do_write (GVfsBackend      *backend,
+          GVfsJobWrite     *job,
+          GVfsBackendHandle handle,
+          char             *buffer,
+          gsize             buffer_size)
+{
+  ProtonWriteHandle *h = handle;
+  g_byte_array_append (h->buf, (const guint8 *) buffer, buffer_size);
+  g_vfs_job_write_set_written_size (job, buffer_size);
+  g_vfs_job_succeeded (G_VFS_JOB (job));
+}
+
+static void
+do_close_write (GVfsBackend      *backend,
+                GVfsJobCloseWrite *job,
+                GVfsBackendHandle  handle)
+{
+  GVfsBackendProton *self = G_VFS_BACKEND_PROTON (backend);
+  ProtonWriteHandle *h    = handle;
+  GError *error = NULL;
+
+  /* Pass NULL cancellable: once upload starts it must run to completion.
+     Cancelling mid-upload leaves an orphaned draft revision on the server. */
+  if (!proton_rpc_write_file (self->rpc,
+                               h->path,
+                               h->mime_type,
+                               h->buf->data,
+                               h->buf->len,
+                               NULL,
+                               &error))
+    {
+      g_vfs_job_failed_from_error (G_VFS_JOB (job), error);
+      g_error_free (error);
+    }
+  else
+    {
+      g_vfs_job_succeeded (G_VFS_JOB (job));
+    }
+
+  g_byte_array_unref (h->buf);
+  g_free (h->mime_type);
+  g_free (h->path);
+  g_free (h);
+}
+
+static void
 do_make_directory (GVfsBackend          *backend,
                    GVfsJobMakeDirectory *job,
                    const gchar          *filename)
@@ -686,6 +758,9 @@ g_vfs_backend_proton_class_init (GVfsBackendProtonClass *klass)
   backend_class->open_for_read      = do_open_for_read;
   backend_class->read               = do_read;
   backend_class->close_read         = do_close_read;
+  backend_class->create             = do_create;
+  backend_class->write              = do_write;
+  backend_class->close_write        = do_close_write;
   backend_class->make_directory     = do_make_directory;
   backend_class->create_dir_monitor  = do_create_dir_monitor;
   backend_class->create_file_monitor = do_create_file_monitor;
